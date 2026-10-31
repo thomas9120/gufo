@@ -1,0 +1,7 @@
+{
+  "_comment": "Host-specific Windows tool paths. Copy to local.json (same directory, git-ignored) and adjust. tools/windows/build.ps1 uses Rocm/Vcpkg/Ninja and first-prompt-control.py uses Models, only for options left at their defaults; explicit arguments always win. Never commit local.json.",
+  "Rocm": "C:\\TheRock\\build",
+  "Vcpkg": "C:\\path\\to\\vcpkg",
+  "Ninja": "ninja",
+  "Models": "C:\\path\\to\\models"
+}

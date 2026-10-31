@@ -1,5 +1,7 @@
 #include "src/cli/serve/text_model_runner.hpp"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -21,11 +23,8 @@
 #include <vector>
 
 #include "src/core/json.hpp"
-#include "src/core/platform/env.hpp"
-#include "src/core/platform/os_info.hpp"
 #include "src/models/qwen/control_tokens.hpp"
 #include "src/models/qwen/vision/prompt.hpp"
-#include "tests/support/temporary_directory.hpp"
 
 using gufo::tokenization::kImEnd;
 using gufo::tokenization::kImStart;
@@ -771,6 +770,32 @@ private:
   std::size_t max_context_;
 };
 
+class TemporaryDirectory {
+public:
+  TemporaryDirectory() {
+    std::string pattern = (std::filesystem::temp_directory_path() /
+                           "gufo-runner-disk-cache-XXXXXX")
+                              .string();
+    const char* created = ::mkdtemp(pattern.data());
+    if (created == nullptr) {
+      throw std::runtime_error("failed to create runner cache directory");
+    }
+    path_ = created;
+  }
+
+  ~TemporaryDirectory() {
+    std::error_code error;
+    std::filesystem::remove_all(path_, error);
+  }
+
+  [[nodiscard]] const std::filesystem::path& path() const noexcept {
+    return path_;
+  }
+
+private:
+  std::filesystem::path path_;
+};
+
 void TestSnapshotForkAndUnsupportedCapabilities() {
   auto stats = std::make_shared<FakeStats>();
   SnapshotRunner runner(stats);
@@ -945,7 +970,7 @@ void TestGeneratedFrontierForksBeforeMutation() {
 
 void TestGeneratedFrontierPersistsForForks() {
   // Persist every frontier; spacing is checked below and by the disk store.
-  TemporaryDirectory directory("gufo-runner-disk-cache");
+  TemporaryDirectory directory;
   const TextRunnerDiskCacheOptions disk{.directory = directory.path(),
                                         .capacity_bytes = 4096,
                                         .staging_capacity_bytes = 4096,
@@ -973,7 +998,7 @@ void TestGeneratedFrontierPersistsForForks() {
 
   // With the default step, the generated frontier one token past the prompt
   // is not written; a restart resumes from the prompt and re-prefills it.
-  TemporaryDirectory spaced_directory("gufo-runner-disk-cache");
+  TemporaryDirectory spaced_directory;
   const TextRunnerDiskCacheOptions spaced{.directory = spaced_directory.path(),
                                           .capacity_bytes = 4096,
                                           .staging_capacity_bytes = 4096};
@@ -1108,7 +1133,7 @@ void TestCancellationRetainsOnlyCompletedWork() {
 }
 
 void TestPersistentSnapshotRestoresAcrossPools() {
-  TemporaryDirectory directory("gufo-runner-disk-cache");
+  TemporaryDirectory directory;
   const TextRunnerDiskCacheOptions disk_cache{
       .directory = directory.path(),
       .capacity_bytes = 4096,
@@ -1162,61 +1187,6 @@ void TestPersistentSnapshotRestoresAcrossPools() {
   miss.Invalidate();
 }
 
-std::size_t RegularFiles(const std::filesystem::path& directory) {
-  std::size_t files = 0;
-  for (const auto& entry :
-       std::filesystem::recursive_directory_iterator(directory))
-    files += entry.is_regular_file();
-  return files;
-}
-
-void TestUnpersistedRequestStaysOffDisk() {
-  TemporaryDirectory directory("gufo-runner-unpersisted");
-  const TextRunnerDiskCacheOptions disk_cache{
-      .directory = directory.path(),
-      .capacity_bytes = 4096,
-      .staging_capacity_bytes = 4096,
-  };
-  std::size_t empty = 0;
-  {
-    auto stats = std::make_shared<FakeStats>();
-    auto runner = std::make_shared<PersistentSnapshotRunner>(
-        stats, "artifact-A", sizeof(FakeSnapshot) - 1);
-    TextRunnerPool pool(runner, 1, disk_cache);
-    empty = RegularFiles(directory.path());
-    auto request = pool.Acquire({1, 2, 3}, {}, {}, {}, true, 0, true,
-                                /*persist=*/false);
-    Expect(request.Prefill(3).decode_ready, "unpersisted request prefills");
-    Expect(request.Commit().disk_queued_bytes == 0,
-           "cache_persist=false queues nothing for disk");
-  }
-  Expect(RegularFiles(directory.path()) == empty,
-         "cache_persist=false leaves no file in the disk cache");
-  {
-    auto stats = std::make_shared<FakeStats>();
-    TextRunnerPool pool(
-        std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A"), 1,
-        disk_cache);
-    auto cold = pool.Acquire({1, 2, 3, 4});
-    Expect(!cold.cache_disk_hit() && stats->snapshot_restores == 0,
-           "a restarted pool finds nothing of an unpersisted request");
-    Expect(cold.Prefill(4).decode_ready, "persisting request prefills");
-    Expect(cold.Commit().disk_queued_bytes > 0,
-           "the default still persists the same prompt");
-  }
-  Expect(RegularFiles(directory.path()) > empty,
-         "a default request writes to the disk cache");
-  auto stats = std::make_shared<FakeStats>();
-  TextRunnerPool pool(
-      std::make_shared<PersistentSnapshotRunner>(stats, "artifact-A"), 1,
-      disk_cache);
-  auto reader = pool.Acquire({1, 2, 3, 4, 5}, {}, {}, {}, true, 0, true,
-                             /*persist=*/false);
-  Expect(reader.cache_disk_hit() && reader.cached_prompt_tokens() == 4,
-         "cache_persist=false still restores existing disk checkpoints");
-  reader.Invalidate();
-}
-
 void TestPromptReuseCanBeDisabledPerRequest() {
   auto stats = std::make_shared<FakeStats>();
   TextRunnerPool pool(std::make_shared<SnapshotRunner>(stats), 1);
@@ -1242,7 +1212,7 @@ void TestPromptReuseCanBeDisabledPerRequest() {
 }
 
 void TestStableChatPrefixSurvivesInterruptedFraming() {
-  TemporaryDirectory directory("gufo-runner-disk-cache");
+  TemporaryDirectory directory;
   const TextRunnerDiskCacheOptions disk_cache{.directory = directory.path(),
                                               .capacity_bytes = 8192,
                                               .staging_capacity_bytes = 4096};
@@ -1562,7 +1532,7 @@ void TestChatFallbackSurvivesSnapshotBudgetPressure() {
 }
 
 void TestFullChatCheckpointRestoresWithoutSuffixPrefill() {
-  TemporaryDirectory directory("gufo-runner-disk-cache");
+  TemporaryDirectory directory;
   const TextRunnerDiskCacheOptions disk_cache{.directory = directory.path(),
                                               .capacity_bytes = 8192,
                                               .staging_capacity_bytes = 4096,
@@ -1598,7 +1568,7 @@ void TestFullChatCheckpointRestoresWithoutSuffixPrefill() {
          "the earlier disk fallback survives exact full-prompt restoration");
   changed.Invalidate();
 
-  TemporaryDirectory legacy_directory("gufo-runner-disk-cache");
+  TemporaryDirectory legacy_directory;
   const TextRunnerDiskCacheOptions legacy_disk{
       .directory = legacy_directory.path(),
       .capacity_bytes = 8192,
@@ -1670,7 +1640,7 @@ void TestNewImageGetsAStableCheckpoint() {
 }
 
 void TestSharedPrefixIsLearnedAndRestoredAcrossConversations() {
-  TemporaryDirectory directory("gufo-runner-disk-cache");
+  TemporaryDirectory directory;
   const TextRunnerDiskCacheOptions disk_cache{
       .directory = directory.path(),
       .capacity_bytes = 8192,
@@ -1830,7 +1800,7 @@ void TestLearnedBoundarySurvivesExactRepublication() {
 
 void TestCoincidentCacheBoundariesShareOneCopy() {
   for (const bool stable : {false, true}) {
-    TemporaryDirectory directory("gufo-runner-disk-cache");
+    TemporaryDirectory directory;
     const TextRunnerDiskCacheOptions disk_cache{
         .directory = directory.path(),
         .capacity_bytes = 1024 * 1024,
@@ -1875,7 +1845,7 @@ void TestCoincidentCacheBoundariesShareOneCopy() {
 }
 
 void TestDiskOnlyCaptureReservesBudgetBeforeCommit() {
-  TemporaryDirectory directory("gufo-runner-disk-cache");
+  TemporaryDirectory directory;
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<PersistentSnapshotRunner>(
       stats, "artifact-A", sizeof(FakeSnapshot) - 1);
@@ -1907,7 +1877,7 @@ void TestDiskOnlyCaptureReservesBudgetBeforeCommit() {
 }
 
 void TestDiskPreflightAvoidsUnusableCapture() {
-  TemporaryDirectory directory("gufo-runner-disk-cache");
+  TemporaryDirectory directory;
   auto stats = std::make_shared<FakeStats>();
   auto runner = std::make_shared<PersistentSnapshotRunner>(
       stats, "artifact-A", sizeof(FakeSnapshot) - 1);
@@ -2069,7 +2039,7 @@ void TestSnapshotCacheCapacityIsReportedAtStartup() {
               " snapshot_entries=128 capacity_bytes=" +
               std::to_string(capacity) +
               " automatic_bytes=" + std::to_string(automatic) +
-              " max_bytes=" + std::to_string(maximum) + " ram_cache=on\n";
+              " max_bytes=" + std::to_string(maximum) + "\n";
           const auto position = output.find(expected);
           Expect(position != std::string::npos &&
                      output.find(expected, position + expected.size()) ==
@@ -2085,93 +2055,6 @@ void TestSnapshotCacheCapacityIsReportedAtStartup() {
       }
     }
   }
-}
-
-void TestRamCacheOptionParsing() {
-  using gufo::server::ParseRamCacheOption;
-  std::string error;
-  const auto off = ParseRamCacheOption("off", &error);
-  Expect(off && !off->enabled, "off disables the RAM cache");
-  const auto automatic = ParseRamCacheOption("0", &error);
-  Expect(automatic && automatic->enabled && automatic->capacity_bytes == 0,
-         "0 still selects the automatic budget");
-  const auto explicit_bytes = ParseRamCacheOption("17179869184", &error);
-  Expect(explicit_bytes && explicit_bytes->enabled &&
-             explicit_bytes->capacity_bytes == std::size_t{16} << 30,
-         "a byte count is an explicit budget");
-  for (const std::string_view bad :
-       {"", "OFF", "Off", " off", "off ", "none", "-1", "+5", "1.5", "16G",
-        "0x10", "99999999999999999999999"}) {
-    error.clear();
-    Expect(!ParseRamCacheOption(bad, &error),
-           "an unclear value is rejected: " + std::string(bad));
-    Expect(error.find("off") != std::string::npos &&
-               error.find("--cache-ram-bytes") != std::string::npos,
-           "the error names the option and the off value");
-  }
-  Expect(!ParseRamCacheOption("nope", nullptr),
-         "a caller may ignore the error text");
-}
-
-/// Off keeps no snapshot at all: nothing is captured or refused, the log says
-/// so, and a session still reuses its own live state.
-void TestRamCacheOffCapturesNothingAndKeepsLiveState() {
-  // Counts reads of the runner's resource claim, which sizes the budget.
-  struct ClaimCountingRunner final : SnapshotRunner {
-    using SnapshotRunner::SnapshotRunner;
-    mutable std::size_t claims{0};
-    [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
-      ++claims;
-      return SnapshotRunner::ResourceClaim();
-    }
-  };
-  std::size_t claims = 0;
-  const auto run = [&claims](
-                       const gufo::server::TextRunnerRamCacheOptions& options,
-                       std::size_t snapshot_budget, std::string* log) {
-    auto stats = std::make_shared<FakeStats>();
-    auto runner =
-        std::make_shared<ClaimCountingRunner>(stats, 64, 256, snapshot_budget);
-    std::ostringstream startup_log;
-    auto* previous = std::clog.rdbuf(startup_log.rdbuf());
-    {
-      TextRunnerPool pool(runner, 1, std::nullopt, options);
-      auto request = pool.Acquire({1, 2, 3});
-      Expect(request.Prefill(3).decode_ready, "request completes");
-      (void)request.Commit();
-      auto extension = pool.Acquire({1, 2, 3, 4});
-      Expect(extension.cache_hit() && extension.cached_prompt_tokens() == 3 &&
-                 extension.cache_restore_bytes() == 0,
-             "live state remains reusable");
-      extension.Invalidate();
-    }
-    std::clog.rdbuf(previous);
-    *log = startup_log.str();
-    claims = runner->claims;
-    return stats;
-  };
-  std::string log;
-  auto stats = run({.enabled = false}, std::size_t{64} << 30, &log);
-  const auto claims_off = claims;
-  Expect(stats->snapshot_captures == 0 && stats->snapshot_restores == 0,
-         "off captures and restores no snapshot");
-  Expect(log.find("ram_cache=off") != std::string::npos &&
-             log.find("capacity_bytes=0 ") != std::string::npos,
-         "startup says the RAM cache is off with no capacity");
-  Expect(log.find("event=snapshot ") == std::string::npos,
-         "off tries no capture, so none is logged as skipped");
-  // The same flow with a budget too small for the snapshot does refuse it.
-  stats = run({}, sizeof(FakeSnapshot) - 1, &log);
-  Expect(log.find("event=snapshot action=skipped reason=byte_capacity") !=
-             std::string::npos,
-         "a budget too small for the snapshot logs the refusal");
-  stats = run({}, std::size_t{64} << 30, &log);
-  Expect(stats->snapshot_captures != 0 &&
-             log.find("ram_cache=on") != std::string::npos,
-         "on captures the snapshot and says so");
-  Expect(claims_off != 0 && claims > claims_off,
-         "off reads the claim only to validate the runner, never to size a "
-         "budget");
 }
 
 void TestMeminfoAvailableExcludesFreeCma() {
@@ -2197,9 +2080,8 @@ void TestCgroupAvailableCountsReclaimableCache() {
   namespace fs = std::filesystem;
   using gufo::server::CgroupAvailableBytes;
   constexpr std::uint64_t gib = std::uint64_t{1} << 30;
-  const auto root =
-      fs::temp_directory_path() /
-      ("gufo_cgroup_test_" + std::to_string(gufo::platform::ProcessId()));
+  const auto root = fs::temp_directory_path() /
+                    ("gufo_cgroup_test_" + std::to_string(::getpid()));
   fs::remove_all(root);
   const auto write = [&](const fs::path& dir, const char* name,
                          const std::string& text) {
@@ -2642,7 +2524,7 @@ int main() {
   TestPreparedConstraintVocabularyKeepsGrammarBehavior();
   // The cache warning assertion in this binary matches the plain "[WARN]
   // [cache]" text captured from a redirected sink; a TTY stderr tints it.
-  gufo::platform::SetEnv("NO_COLOR", "1");
+  ::setenv("NO_COLOR", "1", 1);
   TestInPassStableCheckpoint();
   TestInPassFailureRetainsOnlyCompletedCheckpoints();
   TestNewImageGetsAStableCheckpoint();
@@ -2685,13 +2567,10 @@ int main() {
       "evicting a retained prefix for entry capacity is reported");
 
   TestSnapshotCacheCapacityIsReportedAtStartup();
-  TestRamCacheOptionParsing();
-  TestRamCacheOffCapturesNothingAndKeepsLiveState();
   TestMeminfoAvailableExcludesFreeCma();
   TestCgroupAvailableCountsReclaimableCache();
   TestSnapshotStartupReportsSelectedLimits();
   TestPersistentSnapshotRestoresAcrossPools();
-  TestUnpersistedRequestStaysOffDisk();
   TestSharedPrefixIsLearnedAndRestoredAcrossConversations();
   TestRamLearnsDivergenceBoundaries();
   TestLearnedBoundarySurvivesExactRepublication();

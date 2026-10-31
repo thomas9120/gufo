@@ -357,29 +357,12 @@ captured; RAM-retained snapshots and their captures in progress share the RAM bu
 | Disk bytes | 8 GiB | `--cache-disk-bytes` |
 | Disk staging bytes | smaller of `MemAvailable / 8` and the disk budget | `--cache-disk-staging-bytes` |
 
-`--cache-ram-bytes off` turns the RAM cache off. The server then keeps no
-checkpoint in RAM, commits no cache backing, and computes no budget. Without
-`--cache-disk` it also grows no backing before prefill. Each session still reuses its own live state, `--cache-disk`
-still works, and the per-response `gufo.component_cache` block stays present
-with zero captures. Off drops every RAM checkpoint, so there is no restore from
-RAM, no shared-prefix or branch checkpoint, and no retained history. With
-`--cache-disk`, Qwen and Flash-Next still copy each disk capture through a
-bounded 512 MiB backing, so `backing_prepared` appears in that case only. The
-startup line reports `ram_cache=off capacity_bytes=0`.
-
 `--cache-ram-bytes 0` selects automatic sizing. Zero does not disable reuse.
 A positive value replaces the automatic budget and may exceed it: it trades the
 free half of host RAM for retention, but always leaves 4 GiB to the OS and other
 processes. For an 8 GiB cap, use `--cache-ram-bytes 8589934592`. The startup
 line reports the selected `capacity_bytes`, the `automatic_bytes` budget and
-the `max_bytes` an explicit value may claim. With a DFlash2 draft, each
-Qwen3.8-27B session also pins about 400 MiB of prompt capture at startup,
-reported as `slot_pinned_bytes`. It is charged on top of `capacity_bytes`: an
-explicit value may claim at most `max_bytes` minus `slot_pinned_bytes`, or the
-startup ceiling minus `slot_pinned_bytes` when that ceiling binds.
-`automatic_bytes` is half the available RAM measured before the pins. The
-`global_ram_bytes` gauge and the metadata category include the pins, so live
-usage can exceed `capacity_bytes`.
+the `max_bytes` an explicit value may claim.
 
 Both are sampled after weights and execution states are allocated, then fixed
 for the server run. Flash-Next and Qwen3.8-27B use half the available
@@ -420,8 +403,7 @@ and retry copies are refused. This is a hardware ratio, not a cache policy:
 weights, execution states and the OS leave no more memory. To keep more deep
 conversations:
 
-- Raise `--cache-ram-bytes` towards the reported `max_bytes` (less
-  `slot_pinned_bytes` on Qwen3.8-27B): about 10.5 GB
+- Raise `--cache-ram-bytes` towards the reported `max_bytes`: about 10.5 GB
   here, enough for a 200k-token checkpoint plus a 50k one instead of only the
   first.
 - Run fewer `--sessions`: each Flash-Next session at 262144 context holds about
@@ -458,9 +440,8 @@ Each Flash-Next checkpoint holds about 132 MB of
 private state, so below a budget of about 19 GB that state caps the checkpoint
 count under 128; only larger explicit budgets can reach the record limit. The startup line
 `schema=component-cache-v1 event=configured` reports `capacity_bytes`,
-`automatic_bytes`, `max_bytes`, `staging_capacity_bytes`,
-`disk_capacity_bytes` and `slot_pinned_bytes` (host memory the sessions pinned
-at startup, charged on top of `capacity_bytes`).
+`automatic_bytes`, `max_bytes`, `staging_capacity_bytes` and
+`disk_capacity_bytes`.
 
 Flash-Next prepares a bounded two-segment reserve before readiness and can
 prepare the next segment before a prefill with at least 512 tokens remaining
@@ -573,19 +554,12 @@ versus not, which reuse identically and interoperate within one conversation.
 `/v1/completions` or `/completion` bypasses lookup for a single request. The
 result can still populate the cache. `null` keeps the default, `true`.
 
-`cache_persist: false` on the same endpoints keeps one request's checkpoints
-in RAM only: nothing it captures is written or staged for the disk tier, so
-they are lost on eviction or restart. It still reads disk checkpoints, and it
-does not stop a later request without the flag from persisting the same
-prefix. `null` keeps the default, `true`. Responses echo the applied value as
-a top-level `cache_persist`; see [the server guide](SERVER.md).
-
 ## Observing it
 
 | Log line | Meaning |
 | --- | --- |
-| `event=snapshot_cache_configured` | retained capacity at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim; `ram_cache=on` or `ram_cache=off` at the end of the line |
-| `schema=component-cache-v1 event=configured` | Flash-Next: RAM, staging and disk budgets at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim; `ram_cache=on` or `ram_cache=off` at the end of the line, and `disk_backing_bytes` for the backing an off cache keeps for disk captures |
+| `event=snapshot_cache_configured` | retained capacity at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim |
+| `schema=component-cache-v1 event=configured` | Flash-Next: RAM, staging and disk budgets at startup, with the automatic budget and the most an explicit `--cache-ram-bytes` may claim |
 | `schema=component-cache-v1 event=backing_grown` | Flash-Next: a capture committed another segment of cache pages (about 1 GiB); reports `committed_bytes`, `segments` and the capture's `acquire_ms` |
 | `schema=component-cache-v1 event=backing_limited reason=host_reserve` | Flash-Next: the cache stopped growing below its budget because the host would keep less than 4 GiB available |
 | `schema=component-cache-v1 event=backing_limited reason=device_heap_reserve` | Flash-Next: the cache stopped growing because its pinned pages would leave the device heap less than its 4 GiB dispatch reserve, which would push session and scratch allocations onto managed memory (#460) |
@@ -619,6 +593,26 @@ Match these request-local IDs to `checkpoint_id` in publication/refusal logs:
 an earlier request's asynchronous write may finish after the current response.
 IDs belong to one server lifetime; correlate each restart separately.
 
+`cache_snapshot_bytes` is a per-request sum of snapshot payload bytes
+successfully admitted during that request, not the cache's current occupancy
+or the process RSS. A request can publish several checkpoints and evict older
+ones between publications, so this sum can exceed `--cache-ram-bytes`. In the
+snapshot cache (including older Flash-Next builds), complete logical payloads
+are counted even when snapshots share immutable host blocks; the counter is
+not the number of bytes freshly allocated or copied. For component-cache
+runners, use `usage.gufo.component_cache` for capture and resource accounting.
+The completion log includes `cache_global_ram_bytes`, the contemporaneous
+global RAM ledger gauge, and `cache_copied_payload_bytes`, the payload bytes
+copied by this request. These correspond to `global_ram_bytes` and
+`copied_payload_bytes` in `usage.gufo.component_cache`. The RAM gauge is cache
+accounting, not total process RSS; the copy counter measures work over the
+request, not retained memory.
+
+Snapshot-cache eviction logs omit routine byte-budget evictions and exact
+replacements. Only entry-capacity removals and skipped captures are emitted,
+so the absence of byte-budget removal lines does not establish that no such
+eviction occurred.
+
 Reading them:
 
 - `cache_n` growing turn over turn while `prompt_n` stays flat is healthy
@@ -628,8 +622,11 @@ Reading them:
   `cache_n` and only their own tail in `prompt_n`. With `--log-level debug`,
   `event=shared_prefix_wait` and `event=shared_prefix_ready` name the leader
   and position.
-- `cache_n` **pinned** at the same value while `prompt_n` grows every turn is a
-  checkpoint that stopped advancing. See #335.
+- `cache_n` **pinned** at the same value while `prompt_n` grows every turn means
+  the reusable boundary stopped advancing. Captures may have failed, been
+  evicted, or no longer match the next request's rendered tokens. Successful
+  captures alone do not establish that the next request can reuse them.
+  See #335 for one previously fixed cause.
 - A large `cache_common_prefix_tokens` on a miss means a long prefix agreed and
   could not be resumed from: a mid-history edit, or an evicted checkpoint.
 

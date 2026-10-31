@@ -9,7 +9,6 @@
 #include <fstream>
 #include <string_view>
 
-#include "src/core/platform/env.hpp"
 #include "src/models/deepseek_v4_flash/runtime/model.h"
 
 namespace {
@@ -38,7 +37,7 @@ int main() {
   const auto root = std::filesystem::path(directory);
   const auto path = root / "invalid.gguf";
   const auto lock_path = root / "instance.lock";
-  assert(gufo::platform::SetEnv("DS4_LOCK_FILE", lock_path.string()));
+  assert(::setenv("DS4_LOCK_FILE", lock_path.c_str(), 1) == 0);
   const auto descriptors = OpenDescriptors();
   for (int fixture = 0; fixture < 3; ++fixture) {
     {

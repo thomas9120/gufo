@@ -19,7 +19,8 @@ namespace gufo::server {
 // The reader handles close/ping even while inference or socket output is busy.
 class WebSocket {
 public:
-  WebSocket(int fd, std::string buffered);
+  WebSocket(platform::SocketHandle fd, std::string buffered,
+            std::stop_token stop = {});
   ~WebSocket();
   WebSocket(const WebSocket&) = delete;
   WebSocket& operator=(const WebSocket&) = delete;
@@ -34,7 +35,8 @@ private:
   void ReadLoop();
   bool Read(char* data, std::size_t size);
   bool Send(std::uint8_t opcode, std::string_view bytes);
-  int fd_;
+  platform::SocketHandle fd_;
+  std::stop_token stop_;
   std::string buffered_;
   std::size_t offset_{0};
   std::atomic<bool> closed_{false};

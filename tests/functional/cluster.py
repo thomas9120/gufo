@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Execute a reviewed LLM impact plan; retain every group's evidence."""
+"""Execute a reviewed Flash-Next impact plan; retain every group's evidence."""
 
 import argparse
 import json
@@ -58,26 +58,10 @@ def remove_disk_caches(group_output):
             shutil.rmtree(path, ignore_errors=True)
 
 
-def command(group, binary, weights, output, tier="full", assets=None):
+def command(group, binary, weights, output, tier="full"):
     profile = group["profile"]
-    if assets is None and profile not in ("flash-next-q4/off", "flash-next-q4/mtp"):
+    if profile not in ("flash-next-q4/off", "flash-next-q4/mtp"):
         raise ValueError("Cluster executor only supports Flash-Next: " + profile)
-    if assets is not None:
-        from devlab_models import llm_command, registry
-        key, mode = profile.split('/')
-        model = registry()['models'][key]
-        settings = group['settings']
-        args = [sys.executable, str(HERE / 'run.py'), '--output', str(output),
-                '--sampling-preset', model['sampling'], '--expected-input-modalities',
-                'text,image' if model.get('projector') else 'text',
-                '--startup-timeout', '600', '--record-baseline', '--tier', tier]
-        for suite in group['suites']:
-            args += ['--suite', suite]
-        args += ['--'] + llm_command(key, binary, assets, mode=mode,
-                                    context=settings['context'], sessions=settings['sessions'])
-        if 'cache_ram_bytes' in settings:
-            args += ['--cache-ram-bytes', str(settings['cache_ram_bytes'])]
-        return args
     settings = group["settings"]
     args = [sys.executable, str(HERE / "run.py"), "--output", str(output),
             "--sampling-preset", "qwen38", "--expected-input-modalities", "text,image",
@@ -95,12 +79,12 @@ def command(group, binary, weights, output, tier="full", assets=None):
     return args
 
 
-def execute(plan, binary, weights, output, assets=None):
+def execute(plan, binary, weights, output):
     output.mkdir(parents=True, exist_ok=False)
     rows = []
     for group in plan["groups"]:
         name = group["profile"].replace("/", "-") + "-" + group["configuration"]
-        args = command(group, binary, weights, output / name, plan.get("tier", "full"), assets)
+        args = command(group, binary, weights, output / name, plan.get("tier", "full"))
         print("Running", name, ":", ", ".join(group["suites"]), flush=True)
         log_path = output / (name + ".log")
         with log_path.open("w") as log:
@@ -115,7 +99,7 @@ def execute(plan, binary, weights, output, assets=None):
         rows.append(row)
     report = {"status": "failed" if any(row["exit_code"] for row in rows) else
               ("passed" if rows else "no-functional-impact"),
-              "scope": "Selected LLM candidate correctness",
+              "scope": "Flash-Next AR/MTP candidate correctness",
               "timing_qualification": "not performed; --record-baseline captures observations",
               "tier": plan.get("tier", "full"), "release_only": plan.get("release_only", []),
               "groups": rows, "deferred": plan["deferred"],
@@ -123,7 +107,7 @@ def execute(plan, binary, weights, output, assets=None):
     (output / "summary.json").write_text(json.dumps(report, indent=2) + "\n")
     if os.environ.get("GITHUB_STEP_SUMMARY"):
         with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as summary:
-            summary.write("\n## LLM functional results\n\n")
+            summary.write("\n## Flash-Next functional results\n\n")
             summary.write("Candidate correctness only; timing regressions remain unqualified.\n\n")
             for row in rows:
                 summary.write(f"- {row['profile']} / {row['configuration']}: {row['status']}\n")
@@ -135,7 +119,7 @@ def execute(plan, binary, weights, output, assets=None):
                                   f"failure</summary>\n\n```text\n" + "\n".join(lines + [row["log_tail"]])
                                   + "\n```\n\n</details>\n")
             summary.write(f"\nDeferred suite/profile pairs: {len(plan['deferred'])}. "
-                          f"Outside selected scope: {len(plan['out_of_scope'])}.\n")
+                          f"Outside Flash-Next scope: {len(plan['out_of_scope'])}.\n")
     return int(report["status"] == "failed")
 
 

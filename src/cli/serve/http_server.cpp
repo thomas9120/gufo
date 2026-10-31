@@ -1,5 +1,14 @@
 #include "src/cli/serve/http_server.hpp"
 
+#include <arpa/inet.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
@@ -29,12 +38,9 @@
 #include "src/cli/serve/audio_asr_api.hpp"
 #include "src/cli/serve/audio_tts_api.hpp"
 #include "src/cli/serve/audio_websocket.hpp"
-#include "src/cli/serve/embedding_service.hpp"
-#include "src/cli/serve/embeddings_api.hpp"
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/openai_chat.hpp"
-#include "src/cli/serve/responses_logprobs.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
@@ -44,8 +50,8 @@
 #include "src/cli/serve/websocket.hpp"
 #include "src/core/crypto/sha256.hpp"
 #include "src/core/json.hpp"
-#include "src/core/platform/net.hpp"
 #include "src/core/platform/shutdown_signal.hpp"
+#include "src/core/platform/socket.hpp"
 #include "src/core/utf8.hpp"
 #include "src/models/qwen/chat_template.hpp"
 
@@ -78,11 +84,12 @@ private:
 // Socket I/O helpers
 // ---------------------------------------------------------------------------
 
-bool ReadUntil(std::string& out, int fd, std::string_view delim) {
+bool ReadUntil(std::string& out, platform::SocketHandle fd,
+               std::string_view delim) {
   char buf[4096];
   while (out.find(delim) == std::string::npos) {
-    const std::intptr_t n = net::Receive(fd, buf, sizeof(buf), 0);
-    if (n < 0 && net::IsSocketInterrupted())
+    const ssize_t n = platform::SocketRead(fd, buf, sizeof(buf));
+    if (n < 0 && errno == EINTR)
       continue;
     if (n <= 0)
       return false;
@@ -93,14 +100,14 @@ bool ReadUntil(std::string& out, int fd, std::string_view delim) {
   return true;
 }
 
-bool ReadN(std::string& out, int fd, std::size_t n) {
+bool ReadN(std::string& out, platform::SocketHandle fd, std::size_t n) {
   out.reserve(n);
   std::size_t got = 0;
   char buf[4096];
   while (got < n) {
     const std::size_t want = std::min(sizeof(buf), n - got);
-    const std::intptr_t r = net::Receive(fd, buf, want, 0);
-    if (r < 0 && net::IsSocketInterrupted())
+    const ssize_t r = platform::SocketRead(fd, buf, want);
+    if (r < 0 && errno == EINTR)
       continue;
     if (r <= 0)
       return false;
@@ -110,12 +117,17 @@ bool ReadN(std::string& out, int fd, std::size_t n) {
   return true;
 }
 
-bool SendAll(int fd, std::string_view data) {
+bool SendAll(platform::SocketHandle fd, std::string_view data) {
   std::size_t sent = 0;
   while (sent < data.size()) {
-    const std::intptr_t n =
-        net::SendNoSignal(fd, data.data() + sent, data.size() - sent);
-    if (n < 0 && net::IsSocketInterrupted())
+#ifdef MSG_NOSIGNAL
+    const int flags = MSG_NOSIGNAL;
+#else
+    const int flags = 0;
+#endif
+    const ssize_t n =
+        platform::SocketSend(fd, data.data() + sent, data.size() - sent, flags);
+    if (n < 0 && errno == EINTR)
       continue;
     if (n <= 0)
       return false;
@@ -124,7 +136,8 @@ bool SendAll(int fd, std::string_view data) {
   return true;
 }
 
-bool SendChunk(int fd, std::string_view data, std::string_view prefix = {}) {
+bool SendChunk(platform::SocketHandle fd, std::string_view data,
+               std::string_view prefix = {}) {
   if (data.empty())
     return prefix.empty() || SendAll(fd, prefix);
   char header[2 * sizeof(std::size_t) + 2];
@@ -147,8 +160,31 @@ bool SendChunk(int fd, std::string_view data, std::string_view prefix = {}) {
          SendAll(fd, data) && SendAll(fd, "\r\n");
 }
 
-bool IsPeerDisconnected(int fd) noexcept {
-  return net::IsPeerDisconnected(fd);
+bool IsPeerDisconnected(platform::SocketHandle fd) noexcept {
+  pollfd descriptor{
+      .fd = static_cast<decltype(pollfd::fd)>(fd),
+      .events = POLLIN | POLLERR | POLLHUP,
+      .revents = 0,
+  };
+#ifdef POLLRDHUP
+  descriptor.events |= POLLRDHUP;
+#endif
+  const int ready = ::poll(&descriptor, 1, 0);
+  if (ready <= 0)
+    return false;
+  if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+    return true;
+#ifdef POLLRDHUP
+  if ((descriptor.revents & POLLRDHUP) != 0)
+    return true;
+#endif
+  if ((descriptor.revents & POLLIN) == 0)
+    return false;
+  char byte;
+  const auto count =
+      platform::SocketRecv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+  return count == 0 || (count < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+                        errno != EINTR);
 }
 
 // ---------------------------------------------------------------------------
@@ -636,22 +672,12 @@ struct CompatibilityAllowances {
   bool stream{false};
   bool stream_options{false};
   bool ignore_eos{false};
-  bool logprobs{false};
   bool response_controls{false};
   bool thinking{false};
   bool output_config{false};
   /// Messages tools and tool_choice; Responses uses response_controls.
   bool tools{false};
 };
-
-// The served name a validated request selected; responses echo it. A request
-// without one is answered under the primary name.
-std::string RequestedModel(const json::Value& body,
-                           const TextGenerationBackend& backend) {
-  const auto* model = body.find("model");
-  return model != nullptr && model->is_string() ? model->str()
-                                                : backend.model_id();
-}
 
 // Validate the text subset before dispatch so a client never gets an answer
 // to a different request. Responses also supports streamed output.
@@ -665,7 +691,7 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
   if (const auto* model = body.find("model"); model != nullptr) {
     if (!model->is_string())
       return InvalidCompatibilityRequest("'model' must be a string");
-    if (!backend.serves_model(model->str()))
+    if (model->str() != backend.model_id())
       return Err(404, "Not Found", "requested model is not loaded",
                  "invalid_request_error", "model_not_found");
   }
@@ -715,7 +741,6 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
     if (field != allowances.stop_field &&
         !(field == "stream_options" && allowances.stream_options) &&
         !(field == "ignore_eos" && allowances.ignore_eos) &&
-        !(field == "logprobs" && allowances.logprobs) &&
         !(field == "thinking" && allowances.thinking) &&
         !(field == "output_config" && allowances.output_config) &&
         !((field == "tools" || field == "tool_choice") && allowances.tools) &&
@@ -723,7 +748,10 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
         !(allowances.response_controls &&
           (field == "text" || field == "reasoning" || field == "tools" ||
            field == "tool_choice" || field == "parallel_tool_calls" ||
-           field == "include" || field == "top_logprobs"))) {
+           // include is a standard Responses field (for example encrypted
+           // reasoning); gufo keeps no server-side conversation, so its value
+           // is accepted and ignored.
+           field == "include"))) {
       return InvalidCompatibilityRequest("request field '" + field +
                                          "' is not supported on this endpoint");
     }
@@ -757,15 +785,13 @@ std::optional<HttpResponse> ReadCompatibilityOptions(
 HttpResponse ListModels(TextGenerationBackend* backend,
                         const VideoJobService* video_jobs,
                         const TtsService* tts, const AsrService* asr,
-                        const ImageService* images,
-                        const EmbeddingService* embeddings) {
+                        const ImageService* images) {
   json::Value resp = json::Value::object();
   resp["object"] = "list";
   json::Value data = json::Value::array();
-  for (const auto& id :
-       backend != nullptr ? backend->model_ids() : std::vector<std::string>{}) {
+  if (backend != nullptr) {
     json::Value model = json::Value::object();
-    model["id"] = id;
+    model["id"] = backend->model_id();
     model["object"] = "model";
     model["created"] = Now();
     model["owned_by"] = "gufo";
@@ -829,15 +855,6 @@ HttpResponse ListModels(TextGenerationBackend* backend,
     model["capability"] = "image";
     data.push_back(std::move(model));
   }
-  if (embeddings != nullptr && embeddings->ready()) {
-    json::Value model = json::Value::object();
-    model["id"] = embeddings->model_id();
-    model["object"] = "model";
-    model["created"] = Now();
-    model["owned_by"] = "operator-supplied-gemma";
-    model["capability"] = "embedding";
-    data.push_back(std::move(model));
-  }
   resp["data"] = std::move(data);
   return Ok(resp);
 }
@@ -862,12 +879,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                                                 .stream = true,
                                                 .stream_options = true,
                                                 .ignore_eos = true,
-                                                .logprobs = true,
                                             })) {
     return std::move(*error);
   }
-  if (const auto error = ParseLogprobs(body, false, &sampling_config))
-    return InvalidCompatibilityRequest(error->message);
   const auto* stream_field = body.find("stream");
   const bool stream = stream_field != nullptr && stream_field->as_bool();
   bool include_usage = false;
@@ -902,13 +916,6 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
       return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
     cache_prompt = value->as_bool();
   }
-  bool cache_persist = true;
-  if (const auto* value = body.find("cache_persist");
-      value != nullptr && !value->is_null()) {
-    if (!value->is_bool())
-      return InvalidCompatibilityRequest("'cache_persist' must be a boolean");
-    cache_persist = value->as_bool();
-  }
   std::vector<std::string> stop_sequences;
   if (const auto error = ParseStopSequences(
           body.find("stop"), StopSequenceFormat::kOpenAi, &stop_sequences))
@@ -924,13 +931,12 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                "invalid_request_error", "missing_prompt");
   }
 
-  auto generation =
-      b.start_complete(prompt, max_tokens, sampling_config, req.is_cancelled,
-                       stream, ignore_eos, req.client_id, stop_sequences,
-                       return_progress, cache_prompt, cache_persist);
+  auto generation = b.start_complete(
+      prompt, max_tokens, sampling_config, req.is_cancelled, stream, ignore_eos,
+      req.client_id, stop_sequences, return_progress, cache_prompt);
   const std::string id = "cmpl-" + RandomId();
   const long long created = Now();
-  const std::string model = RequestedModel(body, b);
+  const std::string model = b.model_id();
   if (stream) {
     auto stream_log = std::make_shared<HttpResponse::StreamLog>();
     return {
@@ -942,12 +948,9 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                     {"X-Accel-Buffering", "no"}},
         .streaming_body =
             [generation = std::move(generation), id, created, model,
-             include_usage, return_progress, cache_persist,
-             logprobs = sampling_config.logprobs,
+             include_usage, return_progress,
              stream_log](const HttpResponse::BodyWriter& writer) {
               bool started = return_progress;
-              std::optional<json::Value> pending_logprobs;
-              std::size_t text_offset = 0;
               const auto write_chunk =
                   [&](std::string_view piece, std::string_view finish_reason,
                       const json::Value* usage = nullptr,
@@ -963,10 +966,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       json::Value choice = json::Value::object();
                       choice["text"] = std::string(piece);
                       choice["index"] = 0;
-                      choice["logprobs"] = pending_logprobs
-                                               ? std::move(*pending_logprobs)
-                                               : json::Value();
-                      pending_logprobs.reset();
+                      choice["logprobs"] = json::Value();
                       choice["finish_reason"] =
                           finish_reason.empty()
                               ? json::Value()
@@ -978,9 +978,6 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
                       chunk["usage"] = *usage;
                     if (timings != nullptr)
                       chunk["timings"] = *timings;
-                    // The finishing and usage chunks echo the applied value.
-                    if (usage != nullptr || timings != nullptr)
-                      chunk["cache_persist"] = cache_persist;
                     if (progress != nullptr)
                       chunk["prompt_progress"] = *progress;
                     started = true;
@@ -1000,12 +997,8 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
               }
               try {
                 const auto result = generation->Wait(
-                    [&](const TokenPiece& piece) {
-                      if (logprobs && piece.logprobs)
-                        pending_logprobs = CompletionLogprobs(
-                            std::span(piece.logprobs, 1), text_offset);
-                      const auto text = decoder.Push(piece.text, false);
-                      text_offset += UnicodeLength(text);
+                    [&](std::string_view piece) {
+                      const auto text = decoder.Push(piece, false);
                       connected = write_chunk(text, {});
                       return connected;
                     },
@@ -1084,8 +1077,7 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   json::Value c = json::Value::object();
   c["text"] = core::Utf8Decoder{}.Push(res.text, true);
   c["index"] = 0;
-  c["logprobs"] = sampling_config.logprobs ? CompletionLogprobs(res.logprobs)
-                                           : json::Value();
+  c["logprobs"] = json::Value();
   c["finish_reason"] =
       res.finish_reason == TextGenerationBackend::FinishReason::kLength
           ? "length"
@@ -1094,7 +1086,6 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
   resp["choices"] = std::move(choices);
   resp["usage"] = UsageJson(res);
   resp["timings"] = GenerationTimings(res);
-  resp["cache_persist"] = cache_persist;
   return WithTiming(Ok(resp), res);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
@@ -1104,21 +1095,28 @@ HttpResponse OpenAiCompletions(const HttpRequest& req,
              "invalid_prompt");
 }
 
-std::optional<HttpResponse> ReadOpenAiResponseChat(
-    const json::Value& body, TextGenerationBackend& b, ChatRequest* chat,
-    std::size_t* max_tokens, sampling::SamplingConfig* sampling_config) {
-  chat->reasoning = b.reasoning_defaults();
-  if (auto error = ParseOpenAiResponseControls(body, chat))
-    return error;
-  if (auto error = ReadCompatibilityOptions(
-          body, b, "max_output_tokens", max_tokens, sampling_config,
-          chat->reasoning.enabled,
-          {.stream = true, .response_controls = true})) {
-    return error;
+HttpResponse OpenAiResponses(const HttpRequest& req,
+                             TextGenerationBackend& b) try {
+  json::Value body;
+  try {
+    body = json::parse(req.body);
+  } catch (const std::exception& e) {
+    return Err(400, "Bad Request", e.what(), "invalid_request_error",
+               "parse_error");
   }
-  if (const auto error = ParseResponsesLogprobs(body, sampling_config))
-    return Err(400, "Bad Request", error->message.c_str(),
-               "invalid_request_error", error->code.c_str());
+
+  ChatRequest chat;
+  chat.reasoning = b.reasoning_defaults();
+  if (auto error = ParseOpenAiResponseControls(body, &chat))
+    return std::move(*error);
+  std::size_t max_tokens = 0;
+  sampling::SamplingConfig sampling_config;
+  if (auto error = ReadCompatibilityOptions(
+          body, b, "max_output_tokens", &max_tokens, &sampling_config,
+          chat.reasoning.enabled,
+          {.stream = true, .response_controls = true})) {
+    return std::move(*error);
+  }
 
   std::vector<tokenization::ChatMessage> messages;
   if (const auto* instructions = body.find("instructions")) {
@@ -1139,57 +1137,11 @@ std::optional<HttpResponse> ReadOpenAiResponseChat(
     return InvalidCompatibilityRequest(input_error);
   }
 
-  chat->messages = std::move(messages);
-  return std::nullopt;
-}
-
-HttpResponse OpenAiResponses(const HttpRequest& req,
-                             TextGenerationBackend& b) try {
-  json::Value body;
-  try {
-    body = json::parse(req.body);
-  } catch (const std::exception& e) {
-    return Err(400, "Bad Request", e.what(), "invalid_request_error",
-               "parse_error");
-  }
-
-  ChatRequest chat;
-  std::size_t max_tokens = 0;
-  sampling::SamplingConfig sampling_config;
-  if (auto error =
-          ReadOpenAiResponseChat(body, b, &chat, &max_tokens, &sampling_config))
-    return std::move(*error);
+  chat.messages = std::move(messages);
   chat.client_id = req.client_id;
   return CreateOpenAiResponse(
       req, b, chat, max_tokens, sampling_config,
-      body.find("stream") != nullptr && body.find("stream")->as_bool(),
-      RequestedModel(body, b));
-} catch (const std::length_error& error) {
-  return Err(400, "Bad Request", error.what(), "invalid_request_error",
-             "context_length_exceeded");
-} catch (const std::invalid_argument& error) {
-  return Err(400, "Bad Request", error.what(), "invalid_request_error",
-             "invalid_prompt");
-}
-
-HttpResponse OpenAiResponsesInputTokens(const HttpRequest& req,
-                                        TextGenerationBackend& b) try {
-  json::Value body;
-  try {
-    body = json::parse(req.body);
-  } catch (const std::exception& e) {
-    return Err(400, "Bad Request", e.what(), "invalid_request_error",
-               "parse_error");
-  }
-
-  ChatRequest chat;
-  std::size_t max_tokens = 0;
-  sampling::SamplingConfig sampling_config;
-  if (auto error =
-          ReadOpenAiResponseChat(body, b, &chat, &max_tokens, &sampling_config))
-    return std::move(*error);
-  chat.client_id = req.client_id;
-  return CountOpenAiInputTokens(chat, b);
+      body.find("stream") != nullptr && body.find("stream")->as_bool());
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1334,8 +1286,7 @@ HttpResponse AnthropicMessages(const HttpRequest& req,
   chat.client_id = req.client_id;
   return CreateAnthropicMessage(
       req, b, chat, max_tokens, sampling_config,
-      body.find("stream") != nullptr && body.find("stream")->as_bool(),
-      RequestedModel(body, b));
+      body.find("stream") != nullptr && body.find("stream")->as_bool());
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
              "context_length_exceeded");
@@ -1411,17 +1362,10 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
       return InvalidCompatibilityRequest("'cache_prompt' must be a boolean");
     cache_prompt = value->as_bool();
   }
-  bool cache_persist = true;
-  if (const auto* value = body.find("cache_persist");
-      value != nullptr && !value->is_null()) {
-    if (!value->is_bool())
-      return InvalidCompatibilityRequest("'cache_persist' must be a boolean");
-    cache_persist = value->as_bool();
-  }
 
   const auto res =
       b.complete(prompt, max_tokens, sampling_config, req.is_cancelled, {},
-                 req.client_id, stop_sequences, cache_prompt, cache_persist);
+                 req.client_id, stop_sequences, cache_prompt);
 
   json::Value resp = json::Value::object();
   resp["content"] = core::Utf8Decoder{}.Push(res.text, true);
@@ -1440,7 +1384,6 @@ HttpResponse LlamaCompletion(const HttpRequest& req,
   resp["tokens_cached"] = res.cached_prompt_tokens;
   resp["timings"] = GenerationTimings(res);
   resp["usage"] = UsageJson(res);
-  resp["cache_persist"] = cache_persist;
   return WithTiming(Ok(resp), res);
 } catch (const std::length_error& error) {
   return Err(400, "Bad Request", error.what(), "invalid_request_error",
@@ -1562,6 +1505,7 @@ double KvCacheUsageRatio(const TextGenerationBackend& b) {
 
 HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
   std::ostringstream out;
+  const auto prompt = detail::TotalPromptMetrics().Snapshot();
   out << std::setprecision(std::numeric_limits<double>::max_digits10);
   out << "# HELP gufo_device_lost_total Confirmed GPU context losses\n"
       << "# TYPE gufo_device_lost_total counter\n"
@@ -1570,8 +1514,7 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
   out << "# HELP llamacpp:prompt_tokens_total Total prompt tokens processed, "
          "excluding cache hits\n"
       << "# TYPE llamacpp:prompt_tokens_total counter\n"
-      << "llamacpp:prompt_tokens_total "
-      << detail::TotalPromptTokens().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:prompt_tokens_total " << prompt.tokens << "\n"
       << "# HELP llamacpp:prompt_tokens_cached_total Total prompt tokens "
          "reused from cache\n"
       << "# TYPE llamacpp:prompt_tokens_cached_total counter\n"
@@ -1580,8 +1523,7 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
       << "\n"
       << "# HELP llamacpp:prompt_seconds_total Prompt process time\n"
       << "# TYPE llamacpp:prompt_seconds_total counter\n"
-      << "llamacpp:prompt_seconds_total "
-      << detail::TotalPromptSeconds().load(std::memory_order_relaxed) << "\n"
+      << "llamacpp:prompt_seconds_total " << prompt.seconds << "\n"
       << "# HELP llamacpp:tokens_predicted_total Total tokens generated\n"
       << "# TYPE llamacpp:tokens_predicted_total counter\n"
       << "llamacpp:tokens_predicted_total "
@@ -1656,13 +1598,12 @@ HttpResponse LlamaMetrics(const HttpRequest&, TextGenerationBackend& b) {
 // IPv4 is parsed strictly, without inet_aton shorthand such as `127.1`; IPv6
 // goes through getaddrinfo so link-local scopes (`fe80::1%eth0`) resolve.
 bool ParseListenAddress(const std::string& host, int port,
-                        sockaddr_storage* address, net::SocklenT* length) {
-  *address = {};
-  // Bracketed literals are a URI convention, not a listen host; Winsock's
-  // getaddrinfo would accept them and glibc would not.
-  if (host.find('[') != std::string::npos ||
-      host.find(']') != std::string::npos)
+                        sockaddr_storage* address, socklen_t* length) {
+  // Bracketed literals are URL syntax, not a host address. Linux getaddrinfo
+  // rejects them; Winsock accepts them, so reject them here on both platforms.
+  if (host.empty() || host.front() == '[')
     return false;
+  *address = {};
   const auto network_port = htons(static_cast<std::uint16_t>(port));
   auto* ipv4 = reinterpret_cast<sockaddr_in*>(address);
   if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
@@ -1676,40 +1617,14 @@ bool ParseListenAddress(const std::string& host, int port,
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_flags = AI_NUMERICHOST;
   addrinfo* result = nullptr;
-  if (::getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0) {
-    // Another host's interface name in a link-local scope (`fe80::1%eth0` on
-    // a machine without it) still names a well-formed listener; validate the
-    // address part and resolve the zone best effort. An unknown zone fails
-    // at bind() with the usual error instead of here.
-    const auto zone = host.rfind('%');
-    if (zone == std::string::npos)
-      return false;
-    const std::string bare = host.substr(0, zone);
-    const std::string scope = host.substr(zone + 1);
-    auto* ipv6 = reinterpret_cast<sockaddr_in6*>(address);
-    if (scope.empty() ||
-        ::inet_pton(AF_INET6, bare.c_str(), &ipv6->sin6_addr) != 1)
-      return false;
-    ipv6->sin6_family = AF_INET6;
-    ipv6->sin6_port = network_port;
-    ipv6->sin6_scope_id =
-        std::ranges::all_of(
-            scope,
-            [](char character) {
-              return std::isdigit(static_cast<unsigned char>(character));
-            })
-            ? static_cast<std::uint32_t>(
-                  std::strtoul(scope.c_str(), nullptr, 10))
-            : ::if_nametoindex(scope.c_str());
-    *length = sizeof(sockaddr_in6);
-    return true;
-  }
+  if (::getaddrinfo(host.c_str(), nullptr, &hints, &result) != 0)
+    return false;
   const bool parsed = result != nullptr && result->ai_family == AF_INET6 &&
                       result->ai_addrlen <= sizeof(sockaddr_storage);
   if (parsed) {
     std::memcpy(address, result->ai_addr, result->ai_addrlen);
     reinterpret_cast<sockaddr_in6*>(address)->sin6_port = network_port;
-    *length = static_cast<net::SocklenT>(result->ai_addrlen);
+    *length = static_cast<socklen_t>(result->ai_addrlen);
   }
   ::freeaddrinfo(result);
   return parsed;
@@ -1720,7 +1635,7 @@ bool ParseListenAddress(const std::string& host, int port,
 // `::ffff:a.b.c.d` and is reported as `a.b.c.d`. Empty when unavailable.
 std::string PeerAddress(int client_fd) {
   sockaddr_storage peer{};
-  net::SocklenT length = sizeof(peer);
+  socklen_t length = sizeof(peer);
   if (::getpeername(client_fd, reinterpret_cast<sockaddr*>(&peer), &length) !=
       0)
     return {};
@@ -1746,28 +1661,31 @@ std::string PeerAddress(int client_fd) {
 }  // namespace
 
 LoadingResponder::LoadingResponder(const std::string& host, int port) {
-  net::EnsureSocketRuntimeStarted();
   sockaddr_storage addr{};
-  net::SocklenT addr_length = 0;
+  socklen_t addr_length = 0;
   if (port <= 0 || port > 65535 ||
       !ParseListenAddress(host, port, &addr, &addr_length))
     return;
-  const int fd = static_cast<int>(net::CreateStreamSocket(addr.ss_family));
-  if (fd < 0)
+  const platform::SocketHandle fd = ::socket(addr.ss_family, SOCK_STREAM, 0);
+  if (fd == platform::kInvalidSocket)
     return;
   // Match HttpServer::start, which binds the same address after stop().
-  if (!net::SetExclusiveListenerReuse(fd)) {
-    net::CloseSocket(fd);
-    return;
-  }
-  if ((addr.ss_family == AF_INET6 && !net::ClearIpv6Only(fd)) ||
+  const int yes = 1;
+  const int no = 0;
+#ifdef _WIN32
+  platform::SetSocketOption(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, yes);
+#else
+  platform::SetSocketOption(fd, SOL_SOCKET, SO_REUSEADDR, yes);
+#endif
+  if ((addr.ss_family == AF_INET6 &&
+       platform::SetSocketOption(fd, IPPROTO_IPV6, IPV6_V6ONLY, no) != 0) ||
       ::bind(fd, reinterpret_cast<sockaddr*>(&addr), addr_length) < 0 ||
       ::listen(fd, 16) < 0) {
-    const int error = net::LastSocketError();
+    const int error = errno;
     Logger::Debug("server", "event=loading_listener_unavailable host=" + host +
                                 " port=" + std::to_string(port) +
                                 " errno=" + std::to_string(error));
-    net::CloseSocket(fd);
+    platform::CloseSocket(fd);
     return;
   }
   listen_fd_ = fd;
@@ -1782,9 +1700,9 @@ void LoadingResponder::stop() {
   stopped_.store(true, std::memory_order_release);
   if (thread_.joinable())
     thread_.join();
-  if (listen_fd_ >= 0) {
-    net::CloseSocket(listen_fd_);
-    listen_fd_ = -1;
+  if (listen_fd_ != platform::kInvalidSocket) {
+    platform::CloseSocket(listen_fd_);
+    listen_fd_ = platform::kInvalidSocket;
   }
 }
 
@@ -1794,55 +1712,49 @@ void LoadingResponder::serve() {
   loading.headers.emplace_back("Retry-After", "1");
   const std::string reply = BuildResponse(loading);
   // One connection at a time is enough for probes. Read the request head
-  // before replying, and after replying read what the client still sends (a
-  // request body) until it closes: closing with unread data resets the
-  // connection, and the client can lose the reply. Bound both waits: a client
-  // that connects and sends nothing must not delay stop().
+  // before replying so closing does not reset an unread request, but bound
+  // the wait: a client that connects and sends nothing must not delay stop().
   constexpr auto kRequestWait = std::chrono::milliseconds(500);
   while (!stopped_.load(std::memory_order_acquire)) {
-    if (net::PollReadable(listen_fd_, 100) <= 0)
+    pollfd listener{.fd = static_cast<decltype(pollfd::fd)>(listen_fd_),
+                    .events = POLLIN,
+                    .revents = 0};
+    if (::poll(&listener, 1, 100) <= 0)
       continue;
-    const int client_fd = static_cast<int>(net::AcceptClientSocket(listen_fd_));
-    if (client_fd < 0)
+    const platform::SocketHandle client_fd =
+        ::accept(listen_fd_, nullptr, nullptr);
+    if (client_fd == platform::kInvalidSocket)
       continue;
-    // Appends one read to `into` (when set); false once the deadline passes,
-    // the client closes or stop() runs.
-    const auto receive = [&](std::chrono::steady_clock::time_point deadline,
-                             std::string* into) {
+    std::string head;
+    const auto deadline = std::chrono::steady_clock::now() + kRequestWait;
+    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
+           !stopped_.load(std::memory_order_acquire)) {
       const auto remaining =
           std::chrono::duration_cast<std::chrono::milliseconds>(
               deadline - std::chrono::steady_clock::now())
               .count();
-      if (stopped_.load(std::memory_order_acquire) || remaining <= 0 ||
-          net::PollReadable(client_fd, static_cast<int>(remaining)) <= 0)
-        return false;
-      char buffer[4096];
-      const std::intptr_t received =
-          net::Receive(client_fd, buffer, sizeof(buffer), 0);
+      pollfd client{.fd = static_cast<decltype(pollfd::fd)>(client_fd),
+                    .events = POLLIN,
+                    .revents = 0};
+      if (remaining <= 0 ||
+          ::poll(&client, 1, static_cast<int>(remaining)) <= 0)
+        break;
+      char buffer[2048];
+      const ssize_t received =
+          platform::SocketRead(client_fd, buffer, sizeof(buffer));
       if (received <= 0)
-        return false;
-      if (into != nullptr)
-        into->append(buffer, static_cast<std::size_t>(received));
-      return true;
-    };
-    std::string head;
-    const auto head_deadline = std::chrono::steady_clock::now() + kRequestWait;
-    while (head.find("\r\n\r\n") == std::string::npos && head.size() < 8192 &&
-           receive(head_deadline, &head)) {
+        break;
+      head.append(buffer, static_cast<std::size_t>(received));
     }
     (void)SendAll(client_fd, reply);
-    (void)net::ShutdownSocket(client_fd, net::ShutdownHow::kWrite);
-    const auto drain_deadline = std::chrono::steady_clock::now() + kRequestWait;
-    while (receive(drain_deadline, nullptr)) {
-    }
-    net::CloseSocket(client_fd);
+    ::shutdown(client_fd, SHUT_WR);
+    platform::CloseSocket(client_fd);
   }
 }
 
 bool IsListenAddress(const std::string& host) {
-  net::EnsureSocketRuntimeStarted();
   sockaddr_storage address{};
-  net::SocklenT length = 0;
+  socklen_t length = 0;
   return ParseListenAddress(host, 0, &address, &length);
 }
 
@@ -1874,11 +1786,8 @@ std::string HttpRequest::query_param(const std::string& key) const {
 // ---------------------------------------------------------------------------
 
 struct HttpServer::ConnectionWorker {
-  int fd{-1};  // Protected by workers_mutex_, including shutdown and close.
-  // Set after the final response is written. The server reads nothing more,
-  // so the connection only logs and closes and no longer counts toward the
-  // limit.
-  std::atomic<bool> response_sent{false};
+  // Protected by workers_mutex_, including shutdown and close.
+  platform::SocketHandle fd{platform::kInvalidSocket};
   std::atomic<bool> done{false};
   std::jthread thread;
 };
@@ -1889,8 +1798,7 @@ HttpServer::HttpServer(std::string host, int port,
                        std::shared_ptr<TtsService> tts,
                        std::shared_ptr<AsrService> asr,
                        HttpServerOptions options,
-                       std::shared_ptr<ImageService> images,
-                       std::shared_ptr<EmbeddingService> embeddings)
+                       std::shared_ptr<ImageService> images)
     : host_(std::move(host)),
       port_(port),
       backend_(std::move(backend)),
@@ -1898,7 +1806,6 @@ HttpServer::HttpServer(std::string host, int port,
       tts_(std::move(tts)),
       asr_(std::move(asr)),
       images_(std::move(images)),
-      embeddings_(std::move(embeddings)),
       options_(std::move(options)) {
   if (options_.max_request_body_bytes == 0 || options_.max_connections == 0) {
     throw std::invalid_argument("HTTP server limits must be positive");
@@ -1911,8 +1818,8 @@ HttpServer::HttpServer(std::string host, int port,
 
 HttpServer::~HttpServer() {
   stop();
-  if (listen_fd_ >= 0) {
-    net::CloseSocket(listen_fd_);
+  if (listen_fd_ != platform::kInvalidSocket) {
+    platform::CloseSocket(listen_fd_);
   }
 }
 
@@ -1928,9 +1835,7 @@ void HttpServer::register_routes() {
   // ---- OpenAI ----
   add("POST", "/v1/completions", OpenAiCompletions);
   add("POST", "/v1/chat/completions", HandleOpenAiChat);
-  add("POST", "/v1/chat/completions/input_tokens", HandleOpenAiChatInputTokens);
   add("POST", "/v1/responses", OpenAiResponses);
-  add("POST", "/v1/responses/input_tokens", OpenAiResponsesInputTokens);
   add("POST", "/v1/embeddings", NotImplemented);
 
   // ---- Anthropic ----
@@ -1943,7 +1848,6 @@ void HttpServer::register_routes() {
   add("POST", "/rerank", NotImplemented);
   add("POST", "/infill", NotImplemented);
   add("POST", "/completion", LlamaCompletion);
-  add("POST", "/apply-template", HandleApplyTemplate);
   add("GET", "/props", LlamaProps);
   add("GET", "/slots", LlamaSlots);
   add("GET", "/v1/slots", LlamaSlots);
@@ -1957,15 +1861,15 @@ void HttpServer::register_routes() {
 }
 
 bool HttpServer::start(std::string* error) {
-  net::EnsureSocketRuntimeStarted();
-  if (listen_fd_ >= 0 || stopped_.load(std::memory_order_acquire)) {
+  if (listen_fd_ != platform::kInvalidSocket ||
+      stopped_.load(std::memory_order_acquire)) {
     if (error != nullptr) {
       *error = "HTTP server has already been started or stopped";
     }
     return false;
   }
   sockaddr_storage addr{};
-  net::SocklenT addr_length = 0;
+  socklen_t addr_length = 0;
   if (port_ < 0 || port_ > 65535 ||
       !ParseListenAddress(host_, port_, &addr, &addr_length)) {
     if (error != nullptr) {
@@ -1976,20 +1880,29 @@ bool HttpServer::start(std::string* error) {
     return false;
   }
   platform::IgnoreSocketPipeSignal();
-  listen_fd_ = static_cast<int>(net::CreateStreamSocket(addr.ss_family));
-  if (listen_fd_ < 0) {
+  listen_fd_ = ::socket(addr.ss_family, SOCK_STREAM, 0);
+  if (listen_fd_ == platform::kInvalidSocket) {
     if (error != nullptr)
       *error = "socket() failed";
     return false;
   }
-  (void)net::SetReuseAddr(listen_fd_);
+  const int yes = 1;
+#ifdef _WIN32
+  // Winsock SO_REUSEADDR permits a second server to take an occupied port.
+  platform::SetSocketOption(listen_fd_, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, yes);
+#else
+  platform::SetSocketOption(listen_fd_, SOL_SOCKET, SO_REUSEADDR, yes);
+#endif
   // `::` serves IPv4 clients too. Set it explicitly: the kernel default
   // follows net.ipv6.bindv6only, which differs between hosts.
-  if (addr.ss_family == AF_INET6 && !net::ClearIpv6Only(listen_fd_)) {
+  const int no = 0;
+  if (addr.ss_family == AF_INET6 &&
+      platform::SetSocketOption(listen_fd_, IPPROTO_IPV6, IPV6_V6ONLY, no) !=
+          0) {
     if (error != nullptr)
       *error = "setsockopt(IPV6_V6ONLY) failed";
-    net::CloseSocket(listen_fd_);
-    listen_fd_ = -1;
+    platform::CloseSocket(listen_fd_);
+    listen_fd_ = platform::kInvalidSocket;
     return false;
   }
 
@@ -1997,27 +1910,27 @@ bool HttpServer::start(std::string* error) {
     if (error != nullptr) {
       *error = "bind() failed on " + host_ + ":" + std::to_string(port_);
     }
-    net::CloseSocket(listen_fd_);
-    listen_fd_ = -1;
+    platform::CloseSocket(listen_fd_);
+    listen_fd_ = platform::kInvalidSocket;
     return false;
   }
   if (::listen(listen_fd_, 16) < 0) {
     if (error != nullptr)
       *error = "listen() failed";
-    net::CloseSocket(listen_fd_);
-    listen_fd_ = -1;
+    platform::CloseSocket(listen_fd_);
+    listen_fd_ = platform::kInvalidSocket;
     return false;
   }
   if (port_ == 0) {
     sockaddr_storage bound{};
-    net::SocklenT length = sizeof(bound);
+    socklen_t length = sizeof(bound);
     if (::getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&bound),
                       &length) != 0) {
       if (error != nullptr) {
         *error = "getsockname() failed";
       }
-      net::CloseSocket(listen_fd_);
-      listen_fd_ = -1;
+      platform::CloseSocket(listen_fd_);
+      listen_fd_ = platform::kInvalidSocket;
       return false;
     }
     port_ = ntohs(bound.ss_family == AF_INET6
@@ -2035,17 +1948,12 @@ void HttpServer::run(bool handle_signals) {
   // Poll even without signal handling so device loss is observed while a
   // request worker is blocked writing to a slow client. Nonblocking accept
   // also keeps a vanished connection from wedging this observation loop.
-  if (!net::SetNonBlocking(listen_fd_))
-    throw std::system_error(net::LastSocketError(), std::system_category(),
+  if (platform::SetSocketBlocking(listen_fd_, false) != 0)
+    throw std::system_error(errno, std::generic_category(),
                             "configure HTTP listener");
   Logger::Info(
       "server",
-      "event=listening monotonic_us=" +
-          std::to_string(
-              std::chrono::duration_cast<std::chrono::microseconds>(
-                  std::chrono::steady_clock::now().time_since_epoch())
-                  .count()) +
-          " address=http://" +
+      "event=listening address=http://" +
           (host_.find(':') == std::string::npos ? host_ : "[" + host_ + "]") +
           ":" + std::to_string(port_) +
           " auth=" + (options_.api_key.empty() ? "off" : "bearer") +
@@ -2063,23 +1971,36 @@ void HttpServer::run(bool handle_signals) {
         break;
       }
     }
-    const int ready = net::PollReadable(listen_fd_, 100);
-    if (ready < 0 && !net::IsSocketInterrupted())
-      throw std::system_error(net::LastSocketError(), std::system_category(),
+    pollfd descriptor{.fd = static_cast<decltype(pollfd::fd)>(listen_fd_),
+                      .events = POLLIN,
+                      .revents = 0};
+    const int ready = ::poll(&descriptor, 1, 100);
+    if (stopped_.load(std::memory_order_acquire))
+      break;
+    if (ready < 0 && errno != EINTR)
+      throw std::system_error(errno, std::generic_category(),
                               "poll HTTP listener");
     if (ready <= 0)
       continue;
-    const int client_fd = static_cast<int>(net::AcceptClientSocket(listen_fd_));
-    if (client_fd < 0) {
+    const auto client_fd = ::accept(listen_fd_, nullptr, nullptr);
+    if (client_fd == platform::kInvalidSocket) {
       if (stopped_.load(std::memory_order_acquire)) {
         break;
       }
       continue;
     }
     if (stopped_.load(std::memory_order_acquire)) {
-      net::CloseSocket(client_fd);
+      platform::CloseSocket(client_fd);
       break;
     }
+#ifdef _WIN32
+    // Winsock accept inherits the listener's nonblocking mode. Request
+    // workers use blocking I/O with receive/send timeouts.
+    if (platform::SetSocketBlocking(client_fd, true) != 0) {
+      platform::CloseSocket(client_fd);
+      continue;
+    }
+#endif
 
     reap_workers();
     auto worker = std::make_unique<ConnectionWorker>();
@@ -2087,21 +2008,21 @@ void HttpServer::run(bool handle_signals) {
     bool overloaded = false;
     {
       const std::lock_guard<std::mutex> lock(workers_mutex_);
-      const auto serving = static_cast<std::size_t>(std::ranges::count_if(
-          workers_, [](const std::unique_ptr<ConnectionWorker>& existing) {
-            return !existing->response_sent.load(std::memory_order_acquire);
-          }));
       overloaded = stopped_.load(std::memory_order_acquire) ||
-                   serving >= options_.max_connections;
+                   workers_.size() >= options_.max_connections;
       if (!overloaded) {
         worker_ptr->fd = client_fd;
         worker_ptr->thread = std::jthread([this, worker_ptr, client_fd] {
-          handle_connection(client_fd, worker_ptr->response_sent);
+          handle_connection(client_fd);
+          platform::SocketHandle finished_fd;
           {
             const std::lock_guard<std::mutex> lock(workers_mutex_);
-            net::CloseSocket(worker_ptr->fd);
-            worker_ptr->fd = -1;
+            finished_fd =
+                std::exchange(worker_ptr->fd, platform::kInvalidSocket);
           }
+          // A Windows orderly close may drain briefly. Keep that wait out of
+          // the worker lock so other connections can be stopped or admitted.
+          platform::CloseConnection(finished_fd);
           worker_ptr->done.store(true, std::memory_order_release);
         });
         workers_.push_back(std::move(worker));
@@ -2113,7 +2034,7 @@ void HttpServer::run(bool handle_signals) {
               "server_error", "overloaded");
       response.headers.emplace_back("Retry-After", "1");
       (void)SendAll(client_fd, BuildResponse(response));
-      net::CloseSocket(client_fd);
+      platform::CloseConnection(client_fd);
     }
   }
   reap_workers();
@@ -2121,10 +2042,13 @@ void HttpServer::run(bool handle_signals) {
 
 void HttpServer::stop() {
   const bool was_stopped = stopped_.exchange(true, std::memory_order_acq_rel);
-  if (!was_stopped && listen_fd_ >= 0) {
+  // WSAPoll does not wake on a local shutdown. WebSocket readers observe this
+  // token between bounded waits, without resetting the receive half on close.
+  websocket_stop_.request_stop();
+  if (!was_stopped && listen_fd_ != platform::kInvalidSocket) {
     // Keep the descriptor owned until destruction: run() may still be inside
     // accept(). Closing here allows it to observe a reused descriptor.
-    (void)net::ShutdownSocket(listen_fd_, net::ShutdownHow::kReadWrite);
+    (void)::shutdown(listen_fd_, SHUT_RDWR);
   }
 
   std::vector<std::unique_ptr<ConnectionWorker>> workers;
@@ -2132,8 +2056,8 @@ void HttpServer::stop() {
     const std::lock_guard<std::mutex> lock(workers_mutex_);
     workers = std::move(workers_);
     for (const auto& worker : workers) {
-      if (worker->fd >= 0) {
-        (void)net::ShutdownSocket(worker->fd, net::ShutdownHow::kReadWrite);
+      if (worker->fd != platform::kInvalidSocket) {
+        platform::ShutdownSocket(worker->fd);
       }
     }
   }
@@ -2181,9 +2105,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     const bool ready = (backend_ != nullptr && backend_->ready()) ||
                        (video_jobs_ != nullptr && video_jobs_->ready()) ||
                        (tts_ != nullptr && tts_->ready()) ||
-                       (asr_ != nullptr && asr_->ready()) ||
-                       (embeddings_ != nullptr && embeddings_->ready()) ||
-                       images_ != nullptr;
+                       (asr_ != nullptr && asr_->ready()) || images_ != nullptr;
     if (!ready) {
       return Err(503, "Service Unavailable", "model service is not ready",
                  "server_error", "not_ready");
@@ -2196,8 +2118,6 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
       body["model"] = asr_->model_id();
     } else if (tts_ != nullptr && tts_->ready()) {
       body["model"] = tts_->model_id();
-    } else if (embeddings_ != nullptr && embeddings_->ready()) {
-      body["model"] = embeddings_->model_id();
     } else if (images_ != nullptr) {
       body["model"] = images_->model_id();
     } else {
@@ -2208,7 +2128,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
   if (req.method == "GET" &&
       (req.path == "/v1/models" || req.path == "/models")) {
     return ListModels(backend_.get(), video_jobs_.get(), tts_.get(), asr_.get(),
-                      images_.get(), embeddings_.get());
+                      images_.get());
   }
   if (req.path == "/v1/images/generations" || req.path == "/v1/images/edits") {
     if (!images_)
@@ -2252,23 +2172,6 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
     }
     return HandleAudioAsrApiRequest(req, *asr_);
   }
-  // Handled before the route table. An embedding-only server has no text
-  // backend, and the stub route below must not shadow the service when a
-  // backend exists.
-  if (embeddings_ != nullptr && IsEmbeddingsApiPath(req.path)) {
-    if (device_lost())
-      return DeviceLost();
-    if (!embeddings_->ready()) {
-      return Err(503, "Service Unavailable",
-                 "EmbeddingGemma 2 service is not ready", "server_error",
-                 "embedding_service_unavailable");
-    }
-    auto response = HandleEmbeddingsApiRequest(req, *embeddings_);
-    // The request that finds the device lost runs the shutdown hook.
-    if (device_lost())
-      return DeviceLost();
-    return response;
-  }
   for (const auto& entry : routes_) {
     if (entry.first.first == req.method && entry.first.second == req.path) {
       if (req.method == "POST" && device_lost())
@@ -2281,9 +2184,7 @@ HttpResponse HttpServer::handle_request(const HttpRequest& req) {
 }
 
 bool HttpServer::device_lost() {
-  const bool lost = (backend_ != nullptr && backend_->device_lost()) ||
-                    (embeddings_ != nullptr && embeddings_->device_lost());
-  if (!lost)
+  if (backend_ == nullptr || !backend_->device_lost())
     return false;
   if (options_.on_device_lost &&
       !device_lost_reported_.exchange(true, std::memory_order_acq_rel)) {
@@ -2297,9 +2198,9 @@ bool HttpServer::device_lost() {
   return true;
 }
 
-void HttpServer::handle_connection(int client_fd,
-                                   std::atomic<bool>& response_sent) {
-  (void)net::SetSocketTimeouts(client_fd, 120'000);
+void HttpServer::handle_connection(platform::SocketHandle client_fd) {
+  platform::SetSocketTimeout(client_fd, SO_RCVTIMEO, std::chrono::seconds{120});
+  platform::SetSocketTimeout(client_fd, SO_SNDTIMEO, std::chrono::seconds{120});
 
   const auto start_time = std::chrono::steady_clock::now();
   HttpRequest req;
@@ -2431,8 +2332,9 @@ void HttpServer::handle_connection(int client_fd,
         }
         if (ok) {
           req.body = std::move(body);
-          req.is_cancelled = [client_fd] {
-            return IsPeerDisconnected(client_fd);
+          req.is_cancelled = [this, client_fd] {
+            return stopped_.load(std::memory_order_acquire) ||
+                   IsPeerDisconnected(client_fd);
           };
         }
       }
@@ -2484,7 +2386,8 @@ void HttpServer::handle_connection(int client_fd,
       response_started = true;
       connected = SendAll(client_fd, BuildResponseHead(resp, std::nullopt));
       if (connected) {
-        WebSocket socket(client_fd, std::move(req.body));
+        WebSocket socket(client_fd, std::move(req.body),
+                         websocket_stop_.get_token());
         resp.websocket(socket);
       }
     } else if (resp.streaming_body) {
@@ -2565,7 +2468,6 @@ void HttpServer::handle_connection(int client_fd,
       response_started = true;
       connected = SendAll(client_fd, payload);
     }
-    response_sent.store(true, std::memory_order_release);
     std::string outcome = connected ? "completed" : "disconnected";
     if (resp.stream_log) {
       resp.log_details = resp.stream_log->details;
@@ -2617,7 +2519,6 @@ void HttpServer::handle_connection(int client_fd,
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
-    response_sent.store(true, std::memory_order_release);
   } catch (const std::exception& e) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2636,7 +2537,6 @@ void HttpServer::handle_connection(int client_fd,
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
-    response_sent.store(true, std::memory_order_release);
   } catch (...) {
     const auto duration_ms = std::chrono::duration<double, std::milli>(
                                  std::chrono::steady_clock::now() - start_time)
@@ -2652,7 +2552,6 @@ void HttpServer::handle_connection(int client_fd,
     trace_failure(resp);
     if (!response_started)
       (void)SendAll(client_fd, BuildResponse(resp));
-    response_sent.store(true, std::memory_order_release);
   }
   // Act on a loss found by this request now, not at the next health probe.
   (void)device_lost();

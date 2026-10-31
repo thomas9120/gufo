@@ -156,24 +156,20 @@ def compare_logits(ours: bytes, old: bytes, vocabulary: int) -> dict:
     }
 
 
-def compare_frontiers(directory: Path, narrow: bool = False) -> dict:
+def compare_frontiers(directory: Path) -> dict:
     base, repeat, upstream = (directory / name for name in
                               ("frontiers-gufo-1", "frontiers-gufo-2", "frontiers-upstream"))
     report = load(base / "summary.json")
     require(report == load(repeat / "summary.json"),
             "AR frontier scoring is not exactly reproducible")
-    require(report.get("narrow", False) == narrow, "different frontier scope")
-    depths = (4096, 12288) if narrow else DEPTHS
-    prefill_steps = (32,) if narrow else PREFILL_STEPS
-    points = [(step, depth) for depth in depths for step in prefill_steps]
     require([(point["prefill_step"], point["depth"]) for point in report["points"]]
-            == points,
+            == [(step, depth) for depth in DEPTHS for step in PREFILL_STEPS],
             "incomplete frontier prefill/depth matrix")
     decode_tokens = report["decode_tokens"]
     require(decode_tokens in (0, 128), "unsupported frontier decode length")
     phases = ("before", "after") if decode_tokens else ("before",)
     rows = tsv(upstream / "steps.tsv")
-    require(len(rows) == len(points) * decode_tokens, "incomplete independent decode matrix")
+    require(len(rows) == 10 * decode_tokens, "incomplete independent decode matrix")
     targets = [int(value) for value in (base / "targets.txt").read_text().split()]
     require(len(targets) == 128, "incomplete forced continuation")
     result = {"exact_repeat": True, "vectors": [], "decode": [],
@@ -215,8 +211,6 @@ def compare_frontiers(directory: Path, narrow: bool = False) -> dict:
                 "depth": depth, "phase": phase, "prefill_step": prefill_step,
                 **compare_logits(ours, old, report["vocab"]),
             })
-    if narrow:
-        return result
     # At depth zero both budgets make the identical single 16-token call.
     first, second = report["points"][:2]
     for field in ("greedy", "target_logprobs", *(phase + "_sha256" for phase in phases)):
@@ -235,7 +229,7 @@ def compare_frontiers(directory: Path, narrow: bool = False) -> dict:
 
 
 def run(model: Path, output: Path, upstream: Path, environment: dict,
-        prefill_only: bool = False, narrow: bool = False) -> None:
+        prefill_only: bool = False) -> None:
     """Score both engines, retaining inputs, full logits, scores and provenance."""
     revision = subprocess.check_output(
         ["git", "-C", str(upstream), "rev-parse", "HEAD"], text=True).strip()
@@ -288,8 +282,6 @@ def run(model: Path, output: Path, upstream: Path, environment: dict,
             execute([control / "score_official", model, manifests[group],
                      output / f"upstream-{group}.tsv", context], f"upstream-{group}")
     frontier_options = ["--prefill-only"] if prefill_only else []
-    if narrow:
-        frontier_options.append("--narrow")
     for repeat in (1, 2):
         execute([native, "--reference-frontiers", output / f"frontiers-gufo-{repeat}", *frontier_options],
                 f"frontiers-gufo-{repeat}")
@@ -313,8 +305,7 @@ def run(model: Path, output: Path, upstream: Path, environment: dict,
         "flake_lock_sha256": sha256(ROOT / "flake.lock"),
         "gufo_build_preset": "gpu-test",
         "scope": "prefill-only" if prefill_only else "full",
-        "narrow": narrow,
-        "frontiers": compare_frontiers(output, narrow),
+        "frontiers": compare_frontiers(output),
     }
     report["gates"] = {
         "exact_gufo_repeat": True,

@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -374,9 +373,7 @@ void iq2_gate(unsigned tokens, unsigned blocks, std::mt19937& random) {
                       hipMemcpyDeviceToHost));
       check(hipMemcpy(actual.data(), candidate, size * sizeof(float),
                       hipMemcpyDeviceToHost));
-      const std::string boundary = std::string(name) + " " +
-                                   std::array{"gate", "up", "activation"}[kind];
-      equal(boundary.c_str(), expected.data(), actual.data(), size);
+      equal(name, expected.data(), actual.data(), size);
       for (const auto& [index, values] : samples) {
         if (std::abs(actual[index] - values[kind]) >
             2e-5 * std::max(1., std::abs(values[kind]))) {

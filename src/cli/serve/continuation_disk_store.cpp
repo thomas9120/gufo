@@ -1,5 +1,11 @@
 #include "src/cli/serve/continuation_disk_store.hpp"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -29,8 +35,6 @@
 #include <vector>
 
 #include "src/core/crypto/sha256.hpp"
-#include "src/core/platform/fs.hpp"
-#include "src/core/platform/os_info.hpp"
 
 namespace gufo::server {
 namespace {
@@ -87,44 +91,42 @@ constexpr std::size_t kMaxTokenCount = std::size_t{16} * 1024U * 1024U;
 constexpr std::string_view kFileSuffix = ".kvc";
 constexpr std::string_view kTemporaryPrefix = ".tmp-";
 
-class ScopedPlatformFile {
+class ScopedFileDescriptor {
 public:
-  ScopedPlatformFile() = default;
-  explicit ScopedPlatformFile(platform::PlatformFile descriptor) noexcept
+  ScopedFileDescriptor() = default;
+  explicit ScopedFileDescriptor(int descriptor) noexcept
       : descriptor_(descriptor) {}
-  ~ScopedPlatformFile() {
-    if (platform::FileValid(descriptor_)) {
-      platform::CloseFile(descriptor_);
+  ~ScopedFileDescriptor() {
+    if (descriptor_ >= 0) {
+      ::close(descriptor_);
     }
   }
 
-  ScopedPlatformFile(const ScopedPlatformFile&) = delete;
-  ScopedPlatformFile& operator=(const ScopedPlatformFile&) = delete;
+  ScopedFileDescriptor(const ScopedFileDescriptor&) = delete;
+  ScopedFileDescriptor& operator=(const ScopedFileDescriptor&) = delete;
 
-  ScopedPlatformFile(ScopedPlatformFile&& other) noexcept
-      : descriptor_(std::exchange(other.descriptor_, platform::kInvalidFile)) {}
-  ScopedPlatformFile& operator=(ScopedPlatformFile&& other) noexcept {
+  ScopedFileDescriptor(ScopedFileDescriptor&& other) noexcept
+      : descriptor_(std::exchange(other.descriptor_, -1)) {}
+  ScopedFileDescriptor& operator=(ScopedFileDescriptor&& other) noexcept {
     if (this != &other) {
-      if (platform::FileValid(descriptor_)) {
-        platform::CloseFile(descriptor_);
+      if (descriptor_ >= 0) {
+        ::close(descriptor_);
       }
-      descriptor_ = std::exchange(other.descriptor_, platform::kInvalidFile);
+      descriptor_ = std::exchange(other.descriptor_, -1);
     }
     return *this;
   }
 
-  [[nodiscard]] platform::PlatformFile get() const noexcept {
-    return descriptor_;
-  }
-  [[nodiscard]] platform::PlatformFile release() noexcept {
-    return std::exchange(descriptor_, platform::kInvalidFile);
+  [[nodiscard]] int get() const noexcept { return descriptor_; }
+  [[nodiscard]] int release() noexcept {
+    return std::exchange(descriptor_, -1);
   }
   [[nodiscard]] explicit operator bool() const noexcept {
-    return platform::FileValid(descriptor_);
+    return descriptor_ >= 0;
   }
 
 private:
-  platform::PlatformFile descriptor_{platform::kInvalidFile};
+  int descriptor_{-1};
 };
 
 class ScopedOperationPermit {
@@ -162,28 +164,31 @@ private:
   bool acquired_{false};
 };
 
-class ScopedDirectoryLock {
+class ScopedFileLock {
 public:
-  ScopedDirectoryLock(const platform::Directory& directory,
-                      bool exclusive_nonblocking) noexcept
-      : directory_(directory),
-        acquired_(exclusive_nonblocking
-                      ? platform::TryLockDirectoryExclusive(directory_)
-                      : platform::LockDirectoryShared(directory_)) {}
+  ScopedFileLock(int descriptor, int operation) noexcept
+      : descriptor_(descriptor) {
+    int result;
+    do {
+      result = ::flock(descriptor_, operation);
+    } while (result != 0 && errno == EINTR);
+    acquired_ = result == 0;
+  }
 
-  ~ScopedDirectoryLock() {
+  ~ScopedFileLock() {
     if (acquired_) {
-      platform::UnlockDirectory(directory_);
+      while (::flock(descriptor_, LOCK_UN) != 0 && errno == EINTR) {
+      }
     }
   }
 
   explicit operator bool() const noexcept { return acquired_; }
 
-  ScopedDirectoryLock(const ScopedDirectoryLock&) = delete;
-  ScopedDirectoryLock& operator=(const ScopedDirectoryLock&) = delete;
+  ScopedFileLock(const ScopedFileLock&) = delete;
+  ScopedFileLock& operator=(const ScopedFileLock&) = delete;
 
 private:
-  const platform::Directory& directory_;
+  int descriptor_;
   bool acquired_{false};
 };
 
@@ -286,15 +291,13 @@ std::string ErrnoMessage(std::string_view operation) {
   return std::string(operation) + ": " + std::strerror(errno);
 }
 
-bool WriteAll(platform::PlatformFile descriptor,
-              std::span<const std::uint8_t> bytes) noexcept {
+bool WriteAll(int descriptor, std::span<const std::uint8_t> bytes) noexcept {
   std::size_t offset = 0;
-  std::error_code ec;
   while (offset < bytes.size()) {
-    const std::size_t written = platform::Write(
-        descriptor, bytes.data() + offset, bytes.size() - offset, ec);
-    if (ec) {
-      if (ec == std::errc::interrupted) {
+    const ssize_t written =
+        ::write(descriptor, bytes.data() + offset, bytes.size() - offset);
+    if (written < 0) {
+      if (errno == EINTR) {
         continue;
       }
       return false;
@@ -302,20 +305,18 @@ bool WriteAll(platform::PlatformFile descriptor,
     if (written == 0) {
       return false;
     }
-    offset += written;
+    offset += static_cast<std::size_t>(written);
   }
   return true;
 }
 
-bool ReadAll(platform::PlatformFile descriptor,
-             std::span<std::uint8_t> bytes) noexcept {
+bool ReadAll(int descriptor, std::span<std::uint8_t> bytes) noexcept {
   std::size_t offset = 0;
-  std::error_code ec;
   while (offset < bytes.size()) {
-    const std::size_t count = platform::Read(descriptor, bytes.data() + offset,
-                                             bytes.size() - offset, ec);
-    if (ec) {
-      if (ec == std::errc::interrupted) {
+    const ssize_t count =
+        ::read(descriptor, bytes.data() + offset, bytes.size() - offset);
+    if (count < 0) {
+      if (errno == EINTR) {
         continue;
       }
       return false;
@@ -323,7 +324,7 @@ bool ReadAll(platform::PlatformFile descriptor,
     if (count == 0) {
       return false;
     }
-    offset += count;
+    offset += static_cast<std::size_t>(count);
   }
   return true;
 }
@@ -595,6 +596,9 @@ struct ContinuationDiskStore::Impl {
     queue_changed.notify_all();
     if (writer.joinable())
       writer.join();
+    if (directory_fd >= 0) {
+      ::close(directory_fd);
+    }
   }
 
   void PersistQueued() noexcept {
@@ -652,6 +656,11 @@ struct ContinuationDiskStore::Impl {
   }
 
   void InitializeDirectory() {
+#ifdef _WIN32
+    throw std::runtime_error(
+        "Windows disk cache is unavailable pending durability and "
+        "access-control qualification");
+#endif
     std::error_code error;
     const bool existed = std::filesystem::exists(options.directory, error);
     if (error) {
@@ -665,19 +674,26 @@ struct ContinuationDiskStore::Impl {
       }
     }
 
-    if (!directory_handle.Open(options.directory, error)) {
+    struct stat status{};
+    if (::lstat(options.directory.c_str(), &status) != 0) {
+      throw std::runtime_error(
+          ErrnoMessage("failed to inspect continuation disk directory"));
+    }
+    if (!S_ISDIR(status.st_mode) || S_ISLNK(status.st_mode) ||
+        status.st_uid != ::geteuid()) {
       throw std::runtime_error(
           "continuation disk directory is not a private owned directory");
     }
-    if (!platform::RestrictToOwner(options.directory)) {
+    if (::chmod(options.directory.c_str(), S_IRWXU) != 0) {
       throw std::runtime_error(
           ErrnoMessage("failed to secure continuation disk directory"));
     }
-    platform::FileInfo status{};
-    if (!platform::StatAt(directory_handle, ".", false, &status, error) ||
-        status.regular || !platform::OwnerOnly(status, 0077, 0700)) {
+
+    directory_fd = ::open(options.directory.c_str(),
+                          O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (directory_fd < 0) {
       throw std::runtime_error(
-          "continuation disk directory is not a private owned directory");
+          ErrnoMessage("failed to open continuation disk directory"));
     }
   }
 
@@ -747,18 +763,20 @@ struct ContinuationDiskStore::Impl {
     return Hash(MakeKeyBytes(persistence, tokens));
   }
 
-  [[nodiscard]] bool SafeRegularFile(
-      std::string_view filename, platform::FileInfo* status) const noexcept {
+  [[nodiscard]] bool SafeRegularFile(std::string_view filename,
+                                     struct stat* status) const noexcept {
     if (filename.empty() || filename.find('/') != std::string_view::npos ||
-        filename.find('\\') != std::string_view::npos ||
         filename.find("..") != std::string_view::npos || status == nullptr) {
       return false;
     }
-    std::error_code ec;
-    if (!platform::StatAt(directory_handle, filename, false, status, ec)) {
+    if (::fstatat(directory_fd, std::string(filename).c_str(), status,
+                  AT_SYMLINK_NOFOLLOW) != 0) {
       return false;
     }
-    return status->regular && platform::OwnerOnly(*status, 0077, 0400);
+    return S_ISREG(status->st_mode) && !S_ISLNK(status->st_mode) &&
+           status->st_uid == ::geteuid() &&
+           (status->st_mode & (S_IRWXG | S_IRWXO)) == 0 &&
+           (status->st_mode & S_IRUSR) != 0;
   }
 
   [[nodiscard]] bool ReadImage(std::string_view filename,
@@ -768,57 +786,54 @@ struct ContinuationDiskStore::Impl {
     if (image == nullptr || failure_reason == nullptr) {
       return false;
     }
-    platform::FileInfo status{};
+    struct stat status{};
     if (!SafeRegularFile(filename, &status)) {
       *failure_reason = ContinuationDiskEventReason::kUnsafeFile;
       return false;
     }
-    if (file_bytes != nullptr && status.size > 0)
-      *file_bytes = static_cast<std::size_t>(status.size);
-    if (status.size == 0 || status.size > static_cast<std::uint64_t>(
-                                              options.staging_capacity_bytes)) {
-      *failure_reason = status.size > 0
+    if (file_bytes != nullptr && status.st_size > 0)
+      *file_bytes = static_cast<std::size_t>(status.st_size);
+    if (status.st_size <= 0 ||
+        static_cast<std::uint64_t>(status.st_size) >
+            static_cast<std::uint64_t>(options.staging_capacity_bytes)) {
+      *failure_reason = status.st_size > 0
                             ? ContinuationDiskEventReason::kStagingCapacity
                             : ContinuationDiskEventReason::kCorrupt;
       return false;
     }
-    std::error_code ec;
-    const ScopedPlatformFile file(platform::OpenAt(
-        directory_handle, filename, platform::FileMode::kRead, ec));
+    const ScopedFileDescriptor file(
+        ::openat(directory_fd, std::string(filename).c_str(),
+                 O_RDONLY | O_CLOEXEC | O_NOFOLLOW));
     if (!file) {
       *failure_reason = ContinuationDiskEventReason::kIoFailure;
       return false;
     }
-    image->resize(static_cast<std::size_t>(status.size));
+    image->resize(static_cast<std::size_t>(status.st_size));
     if (!ReadAll(file.get(), *image)) {
       *failure_reason = ContinuationDiskEventReason::kIoFailure;
       return false;
     }
     std::uint8_t trailing = 0;
     while (true) {
-      const std::size_t count = platform::Read(file.get(), &trailing, 1, ec);
-      if (ec) {
-        if (ec == std::errc::interrupted) {
-          continue;
-        }
-        *failure_reason = ContinuationDiskEventReason::kIoFailure;
-        return false;
+      const ssize_t count = ::read(file.get(), &trailing, 1);
+      if (count < 0 && errno == EINTR) {
+        continue;
       }
       if (count != 0) {
-        *failure_reason = ContinuationDiskEventReason::kCorrupt;
+        *failure_reason = count < 0 ? ContinuationDiskEventReason::kIoFailure
+                                    : ContinuationDiskEventReason::kCorrupt;
         return false;
       }
       break;
     }
     // Restore uses the in-memory copy; drop the page-cache one.
-    platform::Advise(file.get(), platform::AdviseHint::kDontNeed, 0, 0);
+    (void)::posix_fadvise(file.get(), 0, 0, POSIX_FADV_DONTNEED);
     return true;
   }
 
   void RemoveFileOnly(std::string_view filename) const noexcept {
     if (!filename.empty()) {
-      std::error_code ec;
-      (void)platform::Unlink(directory_handle, filename, ec);
+      (void)::unlinkat(directory_fd, std::string(filename).c_str(), 0);
     }
   }
 
@@ -837,7 +852,7 @@ struct ContinuationDiskStore::Impl {
         // Publishers hold a shared directory lock from before temporary-file
         // creation through rename. Defer orphan cleanup while any is active;
         // readers must not wait for another store's potentially long write.
-        const ScopedDirectoryLock cleanup_lock(directory_handle, true);
+        const ScopedFileLock cleanup_lock(directory_fd, LOCK_EX | LOCK_NB);
         if (cleanup_lock)
           RemoveFileOnly(filename);
         continue;
@@ -961,9 +976,8 @@ struct ContinuationDiskStore::Impl {
     if (entry == entries.end()) {
       return true;
     }
-    std::error_code ec;
-    if (!platform::Unlink(directory_handle, entry->filename, ec) &&
-        ec != std::errc::no_such_file_or_directory) {
+    if (::unlinkat(directory_fd, entry->filename.c_str(), 0) != 0 &&
+        errno != ENOENT) {
       Emit(ContinuationDiskEventAction::kSkipped,
            ContinuationDiskEventReason::kIoFailure, entry->file_bytes,
            entry->payload_bytes, entry->tokens.size());
@@ -1023,7 +1037,7 @@ struct ContinuationDiskStore::Impl {
         (static_cast<std::uint64_t>(random_device()) << 32U) ^
         static_cast<std::uint64_t>(random_device()) ^
         static_cast<std::uint64_t>(++unique_counter) ^
-        static_cast<std::uint64_t>(platform::ProcessId());
+        static_cast<std::uint64_t>(::getpid());
     std::ostringstream output;
     output << std::hex << std::setfill('0') << std::setw(16) << random_value;
     return output.str();
@@ -1033,10 +1047,10 @@ struct ContinuationDiskStore::Impl {
     for (int attempt = 0; attempt < 64; ++attempt) {
       const std::string filename =
           digest + "-" + UniqueSuffix() + std::string(kFileSuffix);
-      platform::FileInfo status{};
-      std::error_code ec;
-      if (!platform::StatAt(directory_handle, filename, false, &status, ec) &&
-          ec == std::errc::no_such_file_or_directory) {
+      struct stat status{};
+      if (::fstatat(directory_fd, filename.c_str(), &status,
+                    AT_SYMLINK_NOFOLLOW) != 0 &&
+          errno == ENOENT) {
         return filename;
       }
     }
@@ -1050,17 +1064,16 @@ struct ContinuationDiskStore::Impl {
                                   std::size_t payload_bytes) {
     // Save serializes publishers in this instance with write_mutex, and
     // startup indexing completes before its worker starts. Thus no two lock
-    // owners in this instance can share directory_handle's open file
-    // description.
-    const ScopedDirectoryLock publication_lock(directory_handle, false);
+    // owners in this instance can share directory_fd's open file description.
+    const ScopedFileLock publication_lock(directory_fd, LOCK_SH);
     if (!publication_lock)
       return false;
     const std::string temporary_filename =
         std::string(kTemporaryPrefix) + UniqueSuffix();
-    std::error_code ec;
-    ScopedPlatformFile temporary(
-        platform::OpenAt(directory_handle, temporary_filename,
-                         platform::FileMode::kCreateNew, ec));
+    ScopedFileDescriptor temporary(
+        ::openat(directory_fd, temporary_filename.c_str(),
+                 O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
+                 S_IRUSR | S_IWUSR));
     if (!temporary) {
       return false;
     }
@@ -1092,7 +1105,7 @@ struct ContinuationDiskStore::Impl {
         throw std::runtime_error("snapshot serialization truncated");
       }
       const auto checksum = hasher.FinishHex();
-      if (!platform::SeekTo(temporary.get(), kChecksumOffset, ec) ||
+      if (::lseek(temporary.get(), kChecksumOffset, SEEK_SET) < 0 ||
           !WriteAll(temporary.get(),
                     {reinterpret_cast<const std::uint8_t*>(checksum.data()),
                      checksum.size()})) {
@@ -1101,25 +1114,28 @@ struct ContinuationDiskStore::Impl {
     } catch (...) {
       valid = false;
     }
-    valid = valid && platform::SyncFile(temporary.get(), ec);
+    valid = valid && ::fsync(temporary.get()) == 0;
     if (valid) {
       // The image is durable now. Drop its clean pages so multi-GB snapshots
       // don't accumulate in the page cache.
-      platform::Advise(temporary.get(), platform::AdviseHint::kDontNeed, 0, 0);
+      (void)::posix_fadvise(temporary.get(), 0, 0, POSIX_FADV_DONTNEED);
     }
-    platform::CloseFile(temporary.release());
+    const int raw_descriptor = temporary.release();
+    if (::close(raw_descriptor) != 0) {
+      valid = false;
+    }
     if (!valid) {
       RemoveFileOnly(temporary_filename);
       return false;
     }
-    if (!platform::Rename(directory_handle, temporary_filename,
-                          directory_handle, final_filename, ec)) {
+    if (::renameat(directory_fd, temporary_filename.c_str(), directory_fd,
+                   std::string(final_filename).c_str()) != 0) {
       RemoveFileOnly(temporary_filename);
       return false;
     }
-    if (!platform::SyncDirectory(directory_handle, ec)) {
+    if (::fsync(directory_fd) != 0) {
       RemoveFileOnly(final_filename);
-      (void)platform::SyncDirectory(directory_handle, ec);
+      (void)::fsync(directory_fd);
       return false;
     }
     return true;
@@ -1387,7 +1403,8 @@ struct ContinuationDiskStore::Impl {
 
   void TouchEntry(EntryIterator entry) {
     entry->last_access = std::filesystem::file_time_type::clock::now();
-    (void)platform::TouchAt(directory_handle, entry->filename);
+    (void)::utimensat(directory_fd, entry->filename.c_str(), nullptr,
+                      AT_SYMLINK_NOFOLLOW);
   }
 
   [[nodiscard]] std::vector<std::size_t> SharedPrefixBoundaries(
@@ -1460,7 +1477,7 @@ struct ContinuationDiskStore::Impl {
   ContinuationDiskStoreOptions options;
   EventSink event_sink;
   KeyHashFunction key_hash;
-  platform::Directory directory_handle;
+  int directory_fd{-1};
   mutable std::binary_semaphore operation_gate{1};
   std::mutex write_mutex;
   std::list<Entry> entries;

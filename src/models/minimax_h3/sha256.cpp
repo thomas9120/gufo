@@ -6,7 +6,6 @@
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
-#include <vector>
 
 namespace gufo::minimax_h3 {
 
@@ -159,8 +158,7 @@ std::string Sha256File(const std::filesystem::path& path) {
     throw std::runtime_error("cannot open file for SHA-256: " + path.string());
   }
   Context context;
-  // A heap buffer keeps the 1 MiB working set off the Windows stack.
-  std::vector<unsigned char> buffer(1U << 20);
+  std::array<unsigned char, 1U << 20U> buffer{};
   while (stream) {
     stream.read(reinterpret_cast<char*>(buffer.data()),
                 static_cast<std::streamsize>(buffer.size()));

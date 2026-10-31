@@ -150,36 +150,26 @@ int main(int argc, char** argv) try {
     std::vector<float> iq(std::size_t{kSelectRows} * kIndexHeads * kIndexDim);
     for (auto& v : iq)
       v = static_cast<float>(Next(&s) % 2001) / 1000.0F - 1.0F;
-    // The prefill chunk's last row completes (depth + kSelectRows) / kRatio
-    // blocks. Size its rows as the executor sizes a wide batch: by the
-    // populated context, in whole cache lines.
-    const std::uint32_t wide_live = (depth + kSelectRows) / kRatio;
-    const std::uint32_t wide_blocks =
-        ((depth + kSelectRows + kRatio - 1) / kRatio + 31) / 32 * 32;
-    const std::uint32_t wide_words = wide_blocks / 32;
-    std::vector<__half> bk(std::size_t{wide_blocks} * kIndexDim);
+    std::vector<__half> bk(std::size_t{blocks} * kIndexDim);
     for (auto& v : bk)
       v = __float2half(static_cast<float>(Next(&s) % 2001) / 1000.0F - 1.0F);
     float* d_iq = Upload(iq);
     __half* d_bk = Upload(bk);
     float* d_scores =
-        Upload(std::vector<float>(std::size_t{kSelectRows} * wide_blocks));
+        Upload(std::vector<float>(std::size_t{kSelectRows} * blocks));
     std::uint32_t* d_sel = Upload(
-        std::vector<std::uint32_t>(std::size_t{kSelectRows} * wide_words));
+        std::vector<std::uint32_t>(std::size_t{kSelectRows} * mask_words));
     for (const std::uint32_t rows : {1u, 2u, 4u, 8u, kSelectRows}) {
-      const bool wide = rows == kSelectRows;
-      const std::uint32_t row_blocks = wide ? wide_blocks : blocks;
-      const std::uint32_t row_words = wide ? wide_words : mask_words;
       const auto run = [&] {
         q::SelectBlocks(d_iq, d_bk, d_sel, d_scores, rows, d_pos, 0,
-                        kIndexHeads, kIndexDim, kRatio, kSelected, row_words,
-                        row_blocks, nullptr, wide ? wide_live : blocks);
+                        kIndexHeads, kIndexDim, kRatio, kSelected, mask_words,
+                        blocks, nullptr, blocks);
       };
       run();
       CheckHip(hipDeviceSynchronize(), "hipDeviceSynchronize");
-      const std::uint64_t hash = Hash(d_sel, std::size_t{rows} * row_words);
+      const std::uint64_t hash = Hash(d_sel, std::size_t{rows} * mask_words);
       const std::uint64_t score_hash =
-          Hash(d_scores, std::size_t{rows} * row_blocks);
+          Hash(d_scores, std::size_t{rows} * blocks);
       std::vector<float> us(reps);
       for (int i = 0; i < reps; ++i) {
         CheckHip(hipEventRecord(start, nullptr), "hipEventRecord");

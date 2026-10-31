@@ -29,8 +29,6 @@ REQUIRED_SHIPPED_COMPONENTS = {
     "libpng",
     "libjpeg-turbo",
     "libwebp",
-    "libsndfile",
-    "libsoxr",
     "DS4",
     "h3.c",
     "ccv TensorOps ancestry",
@@ -125,8 +123,7 @@ def verify_dependencies(
                     f"{flake_nix_file.name}"
                 )
         for binding in (
-            "torchRocm = ps.torchWithRocm",
-            "torch = torchRocm",
+            "torch = ps.torchWithRocm",
             "torchvision = torchvisionRocm",
             "alexnet-owt-7be5be79.pth",
             "TORCH_HOME",

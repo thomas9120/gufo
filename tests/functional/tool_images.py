@@ -46,8 +46,7 @@ def check_tool_images(client, model, checks, image_content, chat_result, respons
                   if mixed else
                   "Read swatch.png. Report only its dominant color in lowercase.")
         if not image:
-            prompt = ("Read swatch.png. Reply with only the status value in the tool "
-                      "result, without its label.")
+            prompt = "Read swatch.png. Reply with only the status in the tool result."
         # Keep each transport/shape's changed-pixel check independent. Otherwise
         # Responses can legitimately reuse the blue Chat checkpoint from an
         # earlier case because their rendered prompts are identical.

@@ -307,9 +307,6 @@ public:
     std::vector<float> next_token_logits;
     bool hit_eos{false};
     std::size_t physical_width{1};
-    std::size_t lookup_tokens{0};
-    std::size_t lookup_accepted_tokens{0};
-    std::vector<sampling::TokenLogprobs> logprobs;
   };
 
   struct StepRequest {
@@ -387,8 +384,7 @@ private:
   [[nodiscard]] StepResult VerifySequentialStep(
       std::span<const tokenization::TokenId> current_sequence,
       std::uint32_t cur_pos, tokenization::TokenId current_token,
-      tokenization::TokenId eos_id, std::uint32_t max_emitted_tokens,
-      std::optional<std::uint32_t> logprobs);
+      tokenization::TokenId eos_id, std::uint32_t max_emitted_tokens);
 
   std::unique_ptr<ISpeculativeTargetExecutor> owned_target_executor_;
   ISpeculativeTargetExecutor* target_executor_;

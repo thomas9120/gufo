@@ -12,7 +12,6 @@
 #include <string>
 #include <vector>
 
-#include "src/models/qwen/vision/device_input.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/kernels.hpp"
 #include "src/models/qwen38_flash_next/kernels/rocm/mmq/qfn_mmq.h"
 #include "src/models/qwen38_flash_next/rope_scaling.hpp"
@@ -166,35 +165,17 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
   const auto expected_history = download(conv_state, history.size());
   const auto expected_state = download(state, state_count);
   const auto expected_out = download(out, out_count);
-  // Replay 2 queues the Z row tiles on a second stream, as the overlapped
-  // prefill does: the same products, so every byte must match.
-  // Both streams are non-blocking, so the Z tiles really run beside the QKV
-  // tiles and the convolution boundary (the legacy default stream would
-  // serialize them).
-  hipStream_t main_stream = nullptr;
-  hipStream_t z_stream = nullptr;
-  hipEvent_t z_start = nullptr;
-  CheckHip(hipStreamCreateWithFlags(&main_stream, hipStreamNonBlocking),
-           "main stream");
-  CheckHip(hipStreamCreateWithFlags(&z_stream, hipStreamNonBlocking),
-           "Z stream");
-  CheckHip(hipEventCreateWithFlags(&z_start, hipEventDisableTiming), "Z event");
-  for (int replay = 0; replay < 3; ++replay) {
+  for (int replay = 0; replay < 2; ++replay) {
     upload(conv_state, history);
     upload(state, initial_state);
     CheckHip(hipMemset(fused, 0xFF, (reference.size() + 8) * sizeof(float)),
              "poison fused projection");
     CheckHip(hipMemset(scratch, 0xFF, conv_count * sizeof(float)),
              "poison fused convolution");
-    // The poison and uploads ran on the legacy stream, which does not order
-    // the non-blocking streams of replay 2.
-    CheckHip(hipDeviceSynchronize(), "SSM inputs");
     if (!q::DenseF16SsmGemm(w, x, conv_w, conv_state, fused, scratch, batch, m,
-                            k, channels, 4, replay == 2 ? main_stream : nullptr,
-                            0, replay == 2 ? z_stream : nullptr, z_start)) {
+                            k, channels, 4, nullptr)) {
       throw std::runtime_error("SSM projection rejected the shape");
     }
-    CheckHip(hipDeviceSynchronize(), "SSM projection");
     exact(expected_conv, scratch, "convolution");
     const auto projected = download(fused, reference.size() + 8);
     for (std::size_t t = 0; t < batch; ++t) {
@@ -215,9 +196,6 @@ void CheckSsmProjection(const void* w, const __half* x, float* projected,
     exact(expected_state, state, "recurrent state");
     exact(expected_out, out, "output");
   }
-  CheckHip(hipEventDestroy(z_start), "Z event");
-  CheckHip(hipStreamDestroy(z_stream), "Z stream");
-  CheckHip(hipStreamDestroy(main_stream), "main stream");
   // A rejected geometry must not touch any pointer.
   if (q::DenseF16SsmGemm(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
                          0, m, k, channels, 4, nullptr) ||
@@ -280,12 +258,6 @@ void CheckAttentionProjection(
   hipGraph_t graph = nullptr;
   hipGraphExec_t replay = nullptr;
   CheckHip(hipStreamCreate(&stream), "attention stream");
-  gufo::models::qwen::vision::DeviceInput vision;
-  vision.PrepareRope(stream);
-  const auto* descriptor = vision.rope();
-  vision.PrepareRope(stream);
-  if (descriptor == nullptr || vision.rope() != descriptor)
-    throw std::runtime_error("prepared image descriptor is not stable");
   CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
            "attention capture");
   if (!q::AttentionF16Gemm(weights, input, device_gamma, device_gamma + 256,
@@ -293,15 +265,12 @@ void CheckAttentionProjection(
                            static_cast<float*>(actual[1]) + 8,
                            static_cast<__half*>(actual[2]) + 8,
                            static_cast<__half*>(actual[3]) + 8, batch, position,
-                           1e7F, 1e-6F, stream, vision.rope(), yarn))
+                           1e7F, 1e-6F, stream, nullptr, yarn))
     throw std::runtime_error("attention fusion rejected the model shape");
   CheckHip(hipStreamEndCapture(stream, &graph), "attention capture end");
   CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
            "attention graph");
   for (unsigned repetition = 0; repetition < 2; ++repetition) {
-    vision.RestoreLayout({}, stream);
-    if (vision.rope() != descriptor)
-      throw std::runtime_error("text restore replaced the image descriptor");
     for (unsigned i = 0; i < 4; ++i)
       CheckHip(hipMemsetAsync(actual[i], 0xA5,
                               i < 2 ? query_bytes : cache_bytes, stream),
@@ -389,36 +358,6 @@ void CheckHcDownProjection(const void* w, const void* tiled,
   CheckHip(hipFree(output), "HC output free");
   CheckHip(hipFree(reference), "HC reference free");
   CheckHip(hipFree(activated), "HC activation free");
-}
-
-// Q8_0 inject and alpha/beta weights are expanded to F32 at load: every
-// value must equal its block scale times its code, and nothing past `count`
-// may be written.
-void CheckExpandQ8_0(std::size_t m, std::size_t k, std::uint32_t seed) {
-  const Q8Weights w = MakeWeights(m, k, seed);
-  const std::size_t count = m * k;
-  void* d_w = nullptr;
-  float* d_out = nullptr;
-  CheckHip(hipMalloc(&d_w, w.blocks.size()), "expand weights");
-  CheckHip(hipMalloc(&d_out, (count + 64) * 4), "expand output");
-  CheckHip(
-      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
-      "expand weight upload");
-  CheckHip(hipMemset(d_out, 0x7F, (count + 64) * 4), "expand guards");
-  q::ExpandQ8_0(d_w, d_out, count, nullptr);
-  std::vector<float> out(count + 64);
-  CheckHip(hipMemcpy(out.data(), d_out, out.size() * 4, hipMemcpyDeviceToHost),
-           "expand download");
-  if (std::memcmp(out.data(), w.values.data(), count * 4) != 0)
-    throw std::runtime_error("expanded Q8_0 values differ from the codes");
-  for (std::size_t i = count; i < out.size(); ++i) {
-    std::uint32_t bits;
-    std::memcpy(&bits, &out[i], sizeof(bits));
-    if (bits != 0x7F7F7F7FU)
-      throw std::runtime_error("Q8_0 expansion wrote past its count");
-  }
-  CheckHip(hipFree(d_out), "expand output free");
-  CheckHip(hipFree(d_w), "expand weights free");
 }
 
 /// A batch a few tokens past a full 128-token tile computes its tail with
@@ -635,139 +574,6 @@ void CheckDenseAcrossStreams() {
   }
   for (void* p : {d_w, static_cast<void*>(d_x), static_cast<void*>(d_y)})
     CheckHip(hipFree(p), "free");
-}
-
-// A new stream's arena starts small. A batch whose Q8 activations outgrow it
-// adds a block, a small batch after that reuses the first one, and every
-// output matches the same launch on the default stream.
-void CheckArenaGrowth() {
-  constexpr std::size_t m = 2560, k = 6144, small = 8, large = 4096;
-  const Q8Weights w = MakeWeights(m, k, 0x6A0E1A11U);
-  std::vector<float> x(large * k);
-  std::uint32_t state = 0x6A0E1A12U;
-  for (float& v : x)
-    v = Uniform(&state, 2.0F);
-  void* d_w = nullptr;
-  float* d_x = nullptr;
-  float* d_y = nullptr;
-  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "hipMalloc");
-  CheckHip(hipMalloc(&d_x, x.size() * 4), "hipMalloc");
-  CheckHip(hipMalloc(&d_y, large * m * 4), "hipMalloc");
-  CheckHip(
-      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
-      "upload");
-  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
-           "upload");
-  const auto dense = [&](std::size_t batch, hipStream_t stream) {
-    if (qfn_mmq_q8_0_dense(d_w, d_x, d_y, static_cast<int>(m),
-                           static_cast<int>(batch), static_cast<int>(k),
-                           stream) != 0)
-      throw std::runtime_error("MMQ dense failed");
-    CheckHip(hipStreamSynchronize(stream), "dense");
-    std::vector<float> y(batch * m);
-    CheckHip(hipMemcpy(y.data(), d_y, y.size() * 4, hipMemcpyDeviceToHost),
-             "download");
-    return y;
-  };
-  const std::vector<float> want_small = dense(small, nullptr);
-  const std::vector<float> want_large = dense(large, nullptr);
-  hipStream_t stream = nullptr;
-  CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
-  for (int round = 0; round < 2; ++round) {
-    if (dense(small, stream) != want_small)
-      throw std::runtime_error("MMQ dense differs on a small arena");
-    if (dense(large, stream) != want_large)
-      throw std::runtime_error("MMQ dense differs after the arena grew");
-  }
-  qfn_mmq_release_stream(stream);
-  CheckHip(hipStreamDestroy(stream), "stream destroy");
-  for (void* p : {d_w, static_cast<void*>(d_x), static_cast<void*>(d_y)})
-    CheckHip(hipFree(p), "free");
-}
-
-// A graph captured on a stream bakes in that stream's arena addresses. A later
-// eager batch that outgrows the arena must not free or move them: replaying
-// the graph must still match, and must not write memory the arena released.
-void CheckArenaGraphReplay() {
-  constexpr std::size_t m = 2560, k = 6144, small = 8, large = 4096;
-  const Q8Weights w = MakeWeights(m, k, 0x6A0E1A21U);
-  std::vector<float> x(large * k);
-  std::uint32_t state = 0x6A0E1A22U;
-  for (float& v : x)
-    v = Uniform(&state, 2.0F);
-  void* d_w = nullptr;
-  float* d_x = nullptr;
-  float* d_y = nullptr;
-  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "hipMalloc");
-  CheckHip(hipMalloc(&d_x, x.size() * 4), "hipMalloc");
-  CheckHip(hipMalloc(&d_y, large * m * 4), "hipMalloc");
-  CheckHip(
-      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
-      "upload");
-  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
-           "upload");
-  const auto launch = [&](std::size_t batch, hipStream_t stream) {
-    if (qfn_mmq_q8_0_dense(d_w, d_x, d_y, static_cast<int>(m),
-                           static_cast<int>(batch), static_cast<int>(k),
-                           stream) != 0)
-      throw std::runtime_error("MMQ dense failed");
-  };
-  const auto download = [&](std::size_t batch) {
-    std::vector<float> y(batch * m);
-    CheckHip(hipMemcpy(y.data(), d_y, y.size() * 4, hipMemcpyDeviceToHost),
-             "download");
-    return y;
-  };
-  launch(small, nullptr);
-  CheckHip(hipDeviceSynchronize(), "reference");
-  const std::vector<float> want_small = download(small);
-  hipStream_t stream = nullptr;
-  CheckHip(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), "stream");
-  launch(small, stream);
-  CheckHip(hipStreamSynchronize(stream), "warm");
-  hipGraph_t graph = nullptr;
-  hipGraphExec_t replay = nullptr;
-  CheckHip(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal),
-           "capture");
-  launch(small, stream);
-  CheckHip(hipStreamEndCapture(stream, &graph), "capture end");
-  CheckHip(hipGraphInstantiate(&replay, graph, nullptr, nullptr, 0),
-           "instantiate");
-  launch(large, stream);
-  CheckHip(hipStreamSynchronize(stream), "grow");
-  launch(small, stream);
-  CheckHip(hipStreamSynchronize(stream), "after grow");
-  // Take back whatever the arena released and fill it with a pattern.
-  constexpr std::size_t decoy_bytes = std::size_t{16} << 20;
-  std::vector<unsigned char*> decoys(8);
-  for (auto& d : decoys) {
-    CheckHip(hipMalloc(&d, decoy_bytes), "decoy");
-    CheckHip(hipMemset(d, 0x5A, decoy_bytes), "decoy fill");
-  }
-  CheckHip(hipMemset(d_y, 0, small * m * 4), "clear");
-  CheckHip(hipGraphLaunch(replay, stream), "replay");
-  CheckHip(hipStreamSynchronize(stream), "replay wait");
-  const bool output_ok = download(small) == want_small;
-  std::size_t touched = 0;
-  std::vector<unsigned char> host(decoy_bytes);
-  for (auto* d : decoys) {
-    CheckHip(hipMemcpy(host.data(), d, decoy_bytes, hipMemcpyDeviceToHost),
-             "decoy read");
-    for (unsigned char b : host)
-      touched += b != 0x5A;
-  }
-  for (auto* d : decoys)
-    CheckHip(hipFree(d), "decoy free");
-  CheckHip(hipGraphExecDestroy(replay), "graph free");
-  CheckHip(hipGraphDestroy(graph), "graph definition free");
-  qfn_mmq_release_stream(stream);
-  CheckHip(hipStreamDestroy(stream), "stream destroy");
-  for (void* p : {d_w, static_cast<void*>(d_x), static_cast<void*>(d_y)})
-    CheckHip(hipFree(p), "free");
-  if (!output_ok)
-    throw std::runtime_error("MMQ graph replay differs after the arena grew");
-  if (touched != 0)
-    throw std::runtime_error("MMQ graph replay wrote released arena memory");
 }
 
 double Run(std::size_t batch, std::size_t m, std::size_t k, std::uint32_t seed,
@@ -1188,75 +994,6 @@ void CheckMtpOutputHead(float input_scale) {
     CheckHip(hipFree(p), "MTP free");
 }
 
-// A prefill row's W8A8 projection must not depend on the pass width: a
-// prompt finished by a short pass after a checkpoint restore projects its
-// last rows with the 64-token tile (below 96 rows), a wide pass with the
-// 128-token tiles, their tail kernel or, from 1,024 rows of the 2560 x 6144
-// output projection, the wave64 kernel. Each short pass quantizes its own
-// rows, as its combine would.
-void CheckW8A8PassWidths(std::size_t m, std::size_t k, std::size_t wide,
-                         std::uint32_t seed) {
-  const Q8Weights w = MakeWeights(m, k, seed, false);
-  std::vector<float> x(wide * k);
-  std::uint32_t state = seed ^ 0x9A55U;
-  for (float& v : x)
-    v = Uniform(&state, 2.0F);
-  void* d_w = nullptr;
-  float* d_x = nullptr;
-  void* d_tiled = nullptr;
-  float* d_wide = nullptr;
-  float* d_short = nullptr;
-  CheckHip(hipMalloc(&d_w, w.blocks.size() + 4096), "width weights");
-  CheckHip(hipMalloc(&d_x, x.size() * 4), "width input");
-  CheckHip(hipMalloc(&d_tiled, q::Q8TiledBytes(wide, k)), "width tiles");
-  CheckHip(hipMalloc(&d_wide, wide * m * 4), "width wide output");
-  CheckHip(hipMalloc(&d_short, wide * m * 4), "width short output");
-  CheckHip(
-      hipMemcpy(d_w, w.blocks.data(), w.blocks.size(), hipMemcpyHostToDevice),
-      "width weight upload");
-  CheckHip(hipMemcpy(d_x, x.data(), x.size() * 4, hipMemcpyHostToDevice),
-           "width input upload");
-  q::QuantizeQ8Tiled(d_x, d_tiled, wide, k, nullptr);
-  if (!q::W8A8Gemm(d_w, d_tiled, d_wide, wide, m, k, nullptr))
-    throw std::runtime_error("W8A8 wide pass rejected");
-  std::vector<float> reference(wide * m);
-  CheckHip(hipMemcpy(reference.data(), d_wide, reference.size() * 4,
-                     hipMemcpyDeviceToHost),
-           "width wide download");
-  std::size_t failures = 0;
-  for (const std::size_t rows : {1U, 7U, 9U, 95U, 96U}) {
-    for (const std::size_t first :
-         {std::size_t{0}, (wide - rows) / 2, wide - rows}) {
-      q::QuantizeQ8Tiled(d_x + first * k, d_tiled, rows, k, nullptr);
-      if (!q::W8A8Gemm(d_w, d_tiled, d_short, rows, m, k, nullptr))
-        throw std::runtime_error("W8A8 short pass rejected");
-      std::vector<float> actual(rows * m);
-      CheckHip(hipMemcpy(actual.data(), d_short, actual.size() * 4,
-                         hipMemcpyDeviceToHost),
-               "width short download");
-      std::size_t differ = 0;
-      for (std::size_t r = 0; r < rows; ++r)
-        differ += std::memcmp(actual.data() + r * m,
-                              reference.data() + (first + r) * m, m * 4) != 0;
-      if (differ != 0) {
-        std::cout << "W8A8 m=" << m << " k=" << k << ": " << differ << " of "
-                  << rows << " rows from " << first << " differ from the "
-                  << wide << "-row pass\n";
-      }
-      failures += differ;
-    }
-  }
-  (void)hipFree(d_w);
-  (void)hipFree(d_x);
-  (void)hipFree(d_tiled);
-  (void)hipFree(d_wide);
-  (void)hipFree(d_short);
-  if (failures != 0)
-    throw std::runtime_error("W8A8 rows depend on the pass width");
-  std::cout << "W8A8 m=" << m << " k=" << k << " pass widths against " << wide
-            << " rows: exact\n";
-}
-
 }  // namespace
 
 int main() {
@@ -1266,8 +1003,6 @@ int main() {
       throw std::runtime_error("prepare quantized decode projections");
     CheckRoutedQ8Placement();
     CheckDenseAcrossStreams();
-    CheckArenaGrowth();
-    CheckArenaGraphReplay();
     CheckSmallProjection(q::WeightType::kF32, 513, 2560);
     CheckSmallProjection(q::WeightType::kF32, 96, 2560);
     CheckSmallProjection(q::WeightType::kBF16, 129, 2560);
@@ -1286,18 +1021,8 @@ int main() {
     CheckMtpOutputHead(1.0F);
     // Small activations must retain products below F16's normal range.
     CheckMtpOutputHead(0.0001F);
-    // The hc_*_inject [4][10240] and stacked ssm_alpha/beta [96][2560]
-    // shapes.
-    CheckExpandQ8_0(4, 10240, 0xE8A4D1U);
-    CheckExpandQ8_0(96, 2560, 0xE8A4D2U);
     CheckW8A8Tail(320, 10240, 0x7A1320U);
     CheckW8A8Tail(640, 2560, 0x7A1640U);
-    // The output projection takes the wave64 kernel from 1,024 rows; the
-    // others keep the blocked kernel, past a W8A8 tail at 1549 rows.
-    CheckW8A8PassWidths(2560, 6144, 1619, 0x5A6144U);
-    CheckW8A8PassWidths(2560, 6144, 1549, 0x5B6144U);
-    CheckW8A8PassWidths(320, 10240, 1549, 0x5A0320U);
-    CheckW8A8PassWidths(640, 2560, 1619, 0x5A0640U);
     bool ok = true;
     // Ragged batch and rows against the 128-wide macro tiles, the 64-token
     // tile below 96, and the model's ssm_out / shexp_down widths.

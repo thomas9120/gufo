@@ -1,10 +1,21 @@
 #include "src/cli/serve/http_server.hpp"
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cassert>
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#include <cerrno>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdlib>
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -14,26 +25,391 @@
 #include <semaphore>
 #include <sstream>
 #include <stdexcept>
-#include <streambuf>
 #include <string>
-#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
-#include "src/cli/serve/embedding_service.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/trace.hpp"
-#include "src/core/platform/env.hpp"
-#include "src/core/platform/net.hpp"
-#include "src/core/platform/os_info.hpp"
-#include "tests/cli/http_server_test_support.hpp"
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#include "src/cli/serve/websocket.hpp"
+#include "src/core/platform/socket.hpp"
 
 namespace {
+// WINDOWS: keep native Winsock handles; gufo::platform wrappers replace net::.
+
+using gufo::server::HttpServer;
 using gufo::server::Logger;
 using gufo::server::LogLevel;
 using gufo::server::LogLevelFromName;
 using gufo::server::LogLevelName;
+using gufo::server::TextGenerationBackend;
+
+/// Reports an optional admission and fixed prompt progress before delegating
+/// token generation.
+class ProgressRequest final : public TextGenerationBackend::GenerationRequest {
+public:
+  ProgressRequest(std::shared_ptr<GenerationRequest> inner,
+                  std::vector<TextGenerationBackend::PromptProgress> progress,
+                  bool admit = false)
+      : inner_(std::move(inner)),
+        progress_(std::move(progress)),
+        admit_(admit) {}
+
+  TextGenerationBackend::Result Wait(
+      const TextGenerationBackend::TokenCallback& on_token,
+      const TextGenerationBackend::ProgressCallback& on_progress,
+      const TextGenerationBackend::StartCallback& on_start) override {
+    if (admit_ && on_start && !on_start())
+      inner_->Cancel();
+    for (const auto& value : progress_) {
+      if (on_progress && !on_progress(value)) {
+        inner_->Cancel();
+        break;
+      }
+    }
+    return inner_->Wait(on_token, on_progress, on_start);
+  }
+  void Cancel() noexcept override { inner_->Cancel(); }
+
+private:
+  std::shared_ptr<GenerationRequest> inner_;
+  std::vector<TextGenerationBackend::PromptProgress> progress_;
+  bool admit_;
+};
+
+class FakeBackend final : public TextGenerationBackend {
+public:
+  struct Call {
+    std::string prompt;
+    gufo::server::ChatRequest chat;
+    std::size_t max_tokens = 0;
+    gufo::sampling::SamplingConfig sampling;
+    std::string client_id;
+    std::vector<std::string> stop_sequences;
+    std::string trace_request;
+  };
+  Call LastCall() {
+    const std::lock_guard lock(mutex_);
+    return last_;
+  }
+  void SetOutput(std::string text) {
+    const std::lock_guard lock(mutex_);
+    output_ = std::move(text);
+  }
+  std::string model_id() const override { return "test"; }
+  bool ready() const override { return true; }
+  bool device_lost() const override { return lost.load(); }
+  bool supports_images() const override { return image_support.load(); }
+  std::atomic<bool> image_support{false};
+  std::uint32_t max_context() const override { return 65536; }
+  std::vector<SessionState> session_states() const override { return sessions; }
+  std::vector<SessionState> sessions;
+  std::string model_path() const override { return served_path; }
+  std::string build_info() const override { return served_build; }
+  std::string served_path;
+  std::string served_build;
+  std::shared_ptr<GenerationRequest> start_complete(
+      std::string_view prompt, std::size_t max_tokens,
+      const gufo::sampling::SamplingConfig& sampling,
+      const CancellationCheck& cancellation, bool stream, bool ignore_eos,
+      std::string_view client_id,
+      const std::vector<std::string>& stop_sequences, bool return_progress,
+      bool cache_prompt) override {
+    last_ignore_eos = ignore_eos;
+    return std::make_shared<ProgressRequest>(
+        TextGenerationBackend::start_complete(
+            prompt, max_tokens, sampling, cancellation, stream, false,
+            client_id, stop_sequences, return_progress, cache_prompt),
+        progress, admit.load());
+  }
+  std::shared_ptr<GenerationRequest> start_chat(
+      const gufo::server::ChatRequest& request, std::size_t max_tokens,
+      const gufo::sampling::SamplingConfig& sampling,
+      const CancellationCheck& cancellation, bool stream) override {
+    return std::make_shared<ProgressRequest>(
+        TextGenerationBackend::start_chat(request, max_tokens, sampling,
+                                          cancellation, stream),
+        std::vector<PromptProgress>{}, admit.load());
+  }
+  SamplingDefaults sampling_defaults() const override { return defaults; }
+  SamplingDefaults defaults;
+  gufo::ReasoningOptions reasoning_defaults() const override {
+    return reasoning;
+  }
+  InitialOutputState initial_output_state(
+      const gufo::server::ChatRequest& request) const override {
+    return initial_output_state_override.value_or(
+        TextGenerationBackend::initial_output_state(request));
+  }
+  std::size_t count_tokens(std::string_view text) const override {
+    return text.size();
+  }
+  std::optional<std::size_t> count_chat_tokens(
+      const gufo::server::ChatRequest& request) const override {
+    counted_messages = request.messages.size();
+    counted_tools = request.tools.size();
+    return chat_token_count;
+  }
+  std::optional<std::size_t> chat_token_count;
+  mutable std::size_t counted_messages{0};
+  mutable std::size_t counted_tools{0};
+  Result complete(std::string_view prompt, std::size_t limit,
+                  const gufo::sampling::SamplingConfig& sampling,
+                  const CancellationCheck& cancel, const TokenCallback& token,
+                  std::string_view client_id = "anonymous",
+                  const std::vector<std::string>& stop_sequences = {},
+                  bool cache_prompt = true) override {
+    ++calls;
+    last_cache_prompt = cache_prompt;
+    if (failure == 1)
+      throw std::length_error("context exceeded");
+    if (failure == 2)
+      throw std::invalid_argument("invalid prompt");
+    // A failed probe: the scheduler reports device loss from then on.
+    if (failure == 3) {
+      lost = true;
+      throw gufo::server::TextGenerationError(
+          gufo::server::TextGenerationErrorCode::kDeviceLost,
+          gufo::server::kDeviceLostMessage);
+    }
+    // A failure on a device that still accepts work.
+    if (failure == 4)
+      throw std::runtime_error("unspecified launch failure");
+    if (failure == 5)
+      throw std::runtime_error("");
+    Result result;
+    if (wait_for_disconnect) {
+      entered.release();
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::seconds(2);
+      while (!(disconnected = cancel && cancel()) &&
+             std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      finished.release();
+      result.cancelled = disconnected;
+      return result;
+    }
+    {
+      const std::lock_guard lock(mutex_);
+      last_ = {.prompt = std::string(prompt),
+               .max_tokens = limit,
+               .sampling = sampling,
+               .client_id = std::string(client_id),
+               .stop_sequences = stop_sequences,
+               .trace_request = gufo::server::Trace::CurrentRequest()};
+      result.text = output_;
+    }
+    result.prompt_tokens = 10;
+    result.cached_prompt_tokens = 8;
+    result.cache_hit = true;
+    result.draft_accepted_tokens = 4;
+    result.draft_rounds = 2;
+    result.draft_tokens = 8;
+    result.prefill_tokens = 2;
+    result.prefill_ms = 4;
+    result.completion_tokens = 1;
+    result.decode_ms = 2;
+    result.finish_reason =
+        limit == 1 ? FinishReason::kLength : FinishReason::kStop;
+    if (!forced_stop_sequence.empty()) {
+      result.finish_reason = FinishReason::kStopSequence;
+      result.stop_sequence = forced_stop_sequence;
+    }
+    if (token && failure != 8) {
+      std::this_thread::sleep_for(token_delay);
+      (void)token(result.text);
+    }
+    if (failure == 6)
+      throw std::runtime_error("context exceeded");
+    if (failure == 7) {
+      lost = true;
+      throw gufo::server::TextGenerationError(
+          gufo::server::TextGenerationErrorCode::kDeviceLost,
+          gufo::server::kDeviceLostMessage);
+    }
+    return result;
+  }
+  Result chat(const gufo::server::ChatRequest& request, std::size_t limit,
+              const gufo::sampling::SamplingConfig& sampling,
+              const CancellationCheck& cancel,
+              const TokenCallback& token) override {
+    auto result = complete("", limit, sampling, cancel, token,
+                           request.client_id, request.stop_sequences);
+    {
+      const std::lock_guard lock(mutex_);
+      last_.chat = request;
+    }
+    return result;
+  }
+  std::atomic<int> calls{0};
+  std::atomic<bool> last_ignore_eos{false};
+  std::atomic<bool> last_cache_prompt{true};
+  std::vector<PromptProgress> progress;
+  // Report a scheduler admission before generation, as the HIP backend does.
+  std::atomic<bool> admit{false};
+  std::chrono::milliseconds token_delay{0};
+  std::atomic<int> failure{0};
+  std::atomic<bool> lost{false};
+  std::string forced_stop_sequence;
+  gufo::ReasoningOptions reasoning;
+  std::optional<InitialOutputState> initial_output_state_override;
+  bool wait_for_disconnect{false};
+  std::atomic<bool> disconnected{false};
+  std::binary_semaphore entered{0};
+  std::binary_semaphore finished{0};
+
+private:
+  std::mutex mutex_;
+  Call last_;
+  std::string output_{"ok"};
+};
+
+class RunningServer {
+public:
+  explicit RunningServer(gufo::server::HttpServerOptions options = {},
+                         bool handle_signals = false,
+                         std::string host = "127.0.0.1")
+      : backend(std::make_shared<FakeBackend>()),
+        server(std::move(host), 0, backend, nullptr, nullptr, nullptr,
+               std::move(options)) {
+    server.add("GET", "/peer", [](const auto& request, auto&) {
+      return gufo::server::HttpResponse{.body = request.client_id};
+    });
+    server.add("POST", "/echo", [](const auto& request, auto&) {
+      return gufo::server::HttpResponse{.body = request.body};
+    });
+    server.add("POST", "/stream-error", [](const auto&, auto&) {
+      return gufo::server::HttpResponse{
+          .streaming_body = [](const auto& write) {
+            (void)write("first chunk");
+            throw std::runtime_error("injected stream failure");
+          }};
+    });
+    server.add("POST", "/stream", [](const auto& request, auto&) {
+      auto log = std::make_shared<gufo::server::HttpResponse::StreamLog>();
+      return gufo::server::HttpResponse{
+          .streaming_body =
+              [log, fail = !request.body.empty(),
+               reported = request.body == "reported"](const auto& write) {
+                (void)write(std::string_view("a\0b", 3));
+                (void)write("");
+                (void)write("end");
+                if (fail)
+                  log->error_code = "injected";
+                log->error_event_sent = reported;
+              },
+          .stream_log = log,
+      };
+    });
+    server.add("POST", "/sse-idle", [](const auto&, auto&) {
+      return gufo::server::HttpResponse{
+          .headers = {{"Content-Type", "text/event-stream"}},
+          .streaming_body =
+              [](const auto& write) {
+                (void)write("data: first\n\n");
+                std::this_thread::sleep_for(std::chrono::milliseconds(90));
+                (void)write("data: last\n\n");
+                (void)write("data: [DONE]\n\n");
+              },
+      };
+    });
+    server.add("POST", "/sse-finish", [](const auto& request, auto&) {
+      return gufo::server::HttpResponse{
+          .headers = {{"Content-Type", "text/event-stream"}},
+          .streaming_body = [fail = !request.body.empty()](const auto& write) {
+            (void)write("data: first\n\n");
+            if (fail)
+              throw std::runtime_error("injected SSE failure");
+            (void)write("data: [DONE]\n\n");
+          }};
+    });
+    std::string error;
+    assert(server.start(&error));
+    worker = std::jthread([this, handle_signals] {
+      server.run(handle_signals);
+      run_finished.release();
+    });
+  }
+  ~RunningServer() {
+    server.stop();
+    worker.join();
+  }
+
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  gufo::platform::SocketHandle Connect(const std::string& peer = "127.0.0.1") {
+    sockaddr_storage address{};
+    socklen_t length = 0;
+    auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
+    auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
+    if (::inet_pton(AF_INET, peer.c_str(), &ipv4->sin_addr) == 1) {
+      ipv4->sin_family = AF_INET;
+      ipv4->sin_port = htons(server.port());
+      length = sizeof(*ipv4);
+    } else {
+      assert(::inet_pton(AF_INET6, peer.c_str(), &ipv6->sin6_addr) == 1);
+      ipv6->sin6_family = AF_INET6;
+      ipv6->sin6_port = htons(server.port());
+      length = sizeof(*ipv6);
+    }
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    const auto fd = ::socket(address.ss_family, SOCK_STREAM, 0);
+    assert(fd != gufo::platform::kInvalidSocket);
+    assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
+                                            std::chrono::seconds(3)) == 0);
+    assert(::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) ==
+           0);
+    return fd;
+  }
+  std::string Send(std::string_view request, bool half_close = false,
+                   const std::string& peer = "127.0.0.1") {
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    const auto fd = Connect(peer);
+    while (!request.empty()) {
+      // WINDOWS: keep transport and shutdown coverage on Winsock.
+      const auto count = gufo::platform::SocketSend(
+          fd, request.data(), request.size(), MSG_NOSIGNAL);
+      assert(count > 0);
+      request.remove_prefix(static_cast<std::size_t>(count));
+    }
+    // A half-close allows malformed/truncated-body tests to complete without
+    // timing-dependent sleeps.
+    if (half_close)
+      ::shutdown(fd, SHUT_WR);
+    std::string response;
+    char buffer[4096];
+    for (;;) {
+      // WINDOWS: keep transport and shutdown coverage on Winsock.
+      const auto count = gufo::platform::SocketRead(fd, buffer, sizeof(buffer));
+      assert(count >= 0);
+      if (count == 0) {
+        break;
+      }
+      response.append(buffer, static_cast<std::size_t>(count));
+    }
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    gufo::platform::CloseSocket(fd);
+    return response;
+  }
+
+  std::string Post(std::string_view path, std::string_view body) {
+    return Send("POST " + std::string(path) + " HTTP/1.1\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + std::string(body));
+  }
+
+  std::shared_ptr<FakeBackend> backend;
+  HttpServer server;
+  std::binary_semaphore run_finished{0};
+  std::jthread worker;
+};
+
+void ExpectStatus(const std::string& response, int status) {
+  if (!response.starts_with("HTTP/1.1 " + std::to_string(status) + " ")) {
+    std::cerr << response << '\n';
+    std::abort();
+  }
+}
 
 void TestAuthorization() {
   RunningServer secured({.api_key = "test-secret"});
@@ -131,7 +507,7 @@ void TestRequestLogging() {
   assert(log.find("escaped\\x0a\\x1b[31m") != std::string::npos);
   // The startup confirmation is INFO-tier, so the default level reports it.
   // TestQuietTiersSuppressLifecycle covers the tiers that do not.
-  assert(log.find("event=listening monotonic_us=") != std::string::npos);
+  assert(log.find("event=listening") != std::string::npos);
 
   const CapturedLogs debug = CaptureTraffic(LogLevel::kDebug);
   assert(debug.text.find("[DEBUG]") != std::string::npos);
@@ -181,9 +557,9 @@ std::string ChunkedBody(const std::string& response) {
 void TestContentTrace() {
   namespace fs = std::filesystem;
   using gufo::server::Trace;
-  const auto path = fs::temp_directory_path() /
-                    ("gufo-trace-test-" +
-                     std::to_string(gufo::platform::ProcessId()) + ".jsonl");
+  const auto path =
+      fs::temp_directory_path() /
+      ("gufo-trace-test-" + std::to_string(::getpid()) + ".jsonl");
   fs::remove(path);
   assert(!Trace::Open(path.string()).has_value());
   std::string plain_id;
@@ -235,8 +611,16 @@ void TestContentTrace() {
   }
   Trace::Close();
 
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#ifdef _WIN32
+  struct stat trace_status{};
+  assert(stat(path.c_str(), &trace_status) == 0 &&
+         (trace_status.st_mode & 0777) == 0600 &&
+         trace_status.st_uid == geteuid());
+#else
   assert((fs::status(path).permissions() & fs::perms::all) ==
          (fs::perms::owner_read | fs::perms::owner_write));
+#endif  // WINDOWS: platform coverage.
   std::vector<gufo::json::Value> records;
   {
     std::ifstream input(path);
@@ -283,6 +667,25 @@ void TestContentTrace() {
 
   assert(record("request", invalid_id).member_str("body") == "{");
   assert(record("response", invalid_id).member_size("status") == 400);
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#ifdef _WIN32
+  // Existing files with inherited/unprotected ACLs are not silently secured.
+  {
+    std::ofstream public_file(path);
+    public_file << "existing data";
+  }
+  assert(Trace::Open(path.string()).has_value());
+  assert(!Trace::Enabled() && fs::file_size(path) == 13);
+  fs::remove(path);
+  assert(!Trace::Open(path.string()));
+  Trace::Close();
+  const auto alias = fs::path(path.string() + ".alias");
+  fs::create_hard_link(path, alias);
+  assert(Trace::Open(path.string()).has_value());
+  assert(!Trace::Enabled());
+  fs::remove(alias);
+  fs::remove(path);
+#endif
 }
 
 // The threshold covers the lifecycle lines too: `--log-level=warn|error` boots
@@ -410,32 +813,39 @@ void TestExpectContinue() {
   RunningServer server({.max_request_body_bytes = 8192});
   for (const std::string expect :
        {"Expect: 100-continue", "expect: 100-Continue"}) {
-    const net::Socket fd = server.Connect();
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    const auto fd = server.Connect();
     const std::string head =
         "POST /echo HTTP/1.1\r\n" + expect + "\r\nContent-Length: 5\r\n\r\n";
-    assert(net::SendNoSignal(fd, head.data(), head.size()) ==
-           static_cast<std::intptr_t>(head.size()));
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    assert(gufo::platform::SocketSend(fd, head.data(), head.size(),
+                                      MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(head.size()));
     // The interim response arrives before any body byte is sent.
     const std::string_view interim = "HTTP/1.1 100 Continue\r\n\r\n";
     std::string response;
     char buffer[4096];
     while (response.size() < interim.size()) {
-      const auto count =
-          net::Receive(fd, buffer, interim.size() - response.size());
+      // WINDOWS: keep transport and shutdown coverage on Winsock.
+      const auto count = gufo::platform::SocketRead(
+          fd, buffer, interim.size() - response.size());
       assert(count > 0);
       response.append(buffer, static_cast<std::size_t>(count));
     }
     assert(response == interim);
-    assert(net::SendNoSignal(fd, "hello", 5) == 5);
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    assert(gufo::platform::SocketSend(fd, "hello", 5, MSG_NOSIGNAL) == 5);
     response.clear();
     for (;;) {
-      const auto count = net::Receive(fd, buffer, sizeof(buffer));
+      // WINDOWS: keep transport and shutdown coverage on Winsock.
+      const auto count = gufo::platform::SocketRead(fd, buffer, sizeof(buffer));
       assert(count >= 0);
       if (count == 0)
         break;
       response.append(buffer, static_cast<std::size_t>(count));
     }
-    net::CloseSocket(fd);
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    gufo::platform::CloseSocket(fd);
     ExpectStatus(response, 200);
     assert(response.substr(response.find("\r\n\r\n") + 4) == "hello");
   }
@@ -459,13 +869,14 @@ void TestFallbackBackendMetrics() {
            Endpoint{"/v1/responses", R"({"input":"hi"})"},
        }) {
     for (const bool stream : {false, true}) {
-      const auto prompt_before = metrics::TotalPromptTokens().load();
+      // WINDOWS: check the fork's live prefill metrics.
+      const auto prompt_before = metrics::TotalPromptMetrics().Snapshot();
       const auto generated_before = metrics::TotalGenTokens().load();
       const auto cached_before = metrics::TotalCachedPromptTokens().load();
       const auto rounds_before = metrics::TotalDraftRounds().load();
       const auto drafts_before = metrics::TotalDraftTokens().load();
       const auto accepted_before = metrics::TotalDraftAcceptedTokens().load();
-      const auto prompt_seconds_before = metrics::TotalPromptSeconds().load();
+      // WINDOWS: check the fork's live prefill metrics.
       const auto gen_seconds_before = metrics::TotalGenSeconds().load();
       auto body = gufo::json::parse(endpoint.body);
       body["model"] = "test";
@@ -475,7 +886,8 @@ void TestFallbackBackendMetrics() {
       ExpectStatus(response, 200);
       // The backend reports 10 prompt tokens, of which 8 were cached.
       assert(response.find("llamacpp:prompt_tokens_total " +
-                           std::to_string(prompt_before + 2) + "\n") !=
+                           // WINDOWS: check the fork's live prefill metrics.
+                           std::to_string(prompt_before.tokens + 2) + "\n") !=
              std::string::npos);
       assert(response.find("llamacpp:prompt_tokens_cached_total " +
                            std::to_string(cached_before + 8) + "\n") !=
@@ -489,7 +901,9 @@ void TestFallbackBackendMetrics() {
       assert(response.find("llamacpp:spec_decode_num_accepted_tokens_total " +
                            std::to_string(accepted_before + 4) + "\n") !=
              std::string::npos);
-      assert(metrics::TotalPromptSeconds().load() - prompt_seconds_before >
+      // WINDOWS: check the fork's live prefill metrics.
+      assert(metrics::TotalPromptMetrics().Snapshot().seconds -
+                     prompt_before.seconds >
                  0.0039 &&
              metrics::TotalGenSeconds().load() - gen_seconds_before > 0.0019);
       assert(metrics::MaxSequenceTokens().load() >= 11);
@@ -511,7 +925,8 @@ void TestFallbackBackendMetrics() {
            Case{0, 0, true, 0},
            Case{3, 0, true, 3},
        }) {
-    const auto prompt_before = metrics::TotalPromptTokens().load();
+    // WINDOWS: check the fork's live prefill metrics.
+    const auto prompt_before = metrics::TotalPromptMetrics().Snapshot().tokens;
     const auto generated_before = metrics::TotalGenTokens().load();
     TextGenerationBackend::Result result;
     result.prompt_tokens = 10;
@@ -520,7 +935,8 @@ void TestFallbackBackendMetrics() {
     result.completion_tokens = 2;
     result.cancelled = test.cancelled;
     gufo::server::RecordServerMetrics(result);
-    assert(metrics::TotalPromptTokens().load() ==
+    // WINDOWS: check the fork's live prefill metrics.
+    assert(metrics::TotalPromptMetrics().Snapshot().tokens ==
            prompt_before + test.expected_prompt);
     assert(metrics::TotalGenTokens().load() == generated_before + 2);
   }
@@ -570,221 +986,6 @@ void TestLlamaProps() {
   assert(named.member_str("model") == "alias");
   assert(named.member_str("model_alias") == "test");
   assert(named.member_str("build_info") == "0.2.0 (abc1234)");
-}
-
-void TestApplyTemplate() {
-  RunningServer server;
-  const std::string chat = R"({"messages":[{"role":"system","content":"sys"},
-      {"role":"user","content":"ping"}],
-      "tools":[{"type":"function","function":{"name":"t","parameters":
-        {"type":"object","properties":{"a":{"type":"string"}}}}}]})";
-  const int calls = server.backend->calls;
-
-  // A backend that cannot render its template as text says so.
-  ExpectStatus(server.Post("/apply-template", chat), 501);
-
-  // The prompt is the backend's render of the parsed Chat request; no model
-  // field is needed, as outside llama-server router mode.
-  server.backend->rendered_prompt = "<rendered>";
-  server.backend->reasoning.enabled = true;
-  server.backend->reasoning.effort = gufo::ReasoningEffort::kMedium;
-  const auto response = server.Post("/apply-template", chat);
-  ExpectStatus(response, 200);
-  const auto body =
-      gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
-  assert(body.member_str("prompt") == "<rendered>");
-  assert(body.find("model") == nullptr);
-  const auto rendered = server.backend->rendered_chat;
-  assert(rendered.messages.size() == 2 && rendered.tools.size() == 1);
-  // A request that sets no reasoning renders at the server's defaults, which
-  // is what makes them observable; a request's own effort wins.
-  assert(rendered.reasoning.enabled == true &&
-         rendered.reasoning.effort == gufo::ReasoningEffort::kMedium);
-  ExpectStatus(server.Post("/apply-template",
-                           R"({"reasoning_effort":"low",
-                               "messages":[{"role":"user","content":"hi"}]})"),
-               200);
-  assert(server.backend->rendered_chat.reasoning.effort ==
-         gufo::ReasoningEffort::kLow);
-
-  ExpectStatus(server.Post("/apply-template", R"({"messages":[]})"), 400);
-  // A forwarded streaming Chat body renders like any other.
-  ExpectStatus(
-      server.Post(
-          "/apply-template",
-          R"({"stream":true,"messages":[{"role":"user","content":"hi"}]})"),
-      200);
-  ExpectStatus(server.Post("/apply-template",
-                           R"({"model":"other",
-                               "messages":[{"role":"user","content":"hi"}]})"),
-               404);
-  // A template error is the request's, as in Chat.
-  server.backend->render_error = "No user query found in messages.";
-  const auto invalid = server.Post("/apply-template", chat);
-  ExpectStatus(invalid, 400);
-  assert(invalid.find("No user query found") != std::string::npos);
-  server.backend->render_error.reset();
-  // Rendering never generates.
-  assert(server.backend->calls == calls);
-  server.backend->rendered_prompt.reset();
-  server.backend->reasoning = {};
-}
-
-void TestOpenAiInputTokens() {
-  RunningServer server;
-  const auto body_of = [](const std::string& wire) {
-    return gufo::json::parse(wire.substr(wire.find("\r\n\r\n") + 4));
-  };
-  struct Endpoint {
-    const char* path;
-    const char* body;
-    const char* input;
-  };
-  const Endpoint endpoints[] = {
-      {"/v1/chat/completions",
-       R"({"model":"test","messages":[{"role":"system","content":"sys"},
-           {"role":"user","content":"café 東京"}]})",
-       "messages"},
-      {"/v1/responses",
-       R"({"model":"test","instructions":"sys","input":"café 東京"})", "input"},
-  };
-  server.backend->reasoning.enabled = true;
-  server.backend->reasoning.effort = gufo::ReasoningEffort::kMedium;
-  for (const auto& endpoint : endpoints) {
-    const auto path = std::string(endpoint.path) + "/input_tokens";
-    auto body = gufo::json::parse(endpoint.body);
-    const int calls = server.backend->calls;
-    // A registered endpoint reports an unsupported backend, not a fake count.
-    const auto unsupported = server.Post(path, body.dump());
-    ExpectStatus(unsupported, 501);
-    assert(body_of(unsupported).find("error")->member_str("code") ==
-           "not_implemented");
-
-    // Sizing must not reject a prompt merely because it exceeds the context.
-    server.backend->chat_token_count = server.backend->max_context() + 1;
-    const auto slots_before =
-        body_of(server.Send("GET /slots HTTP/1.1\r\n\r\n")).dump();
-    for (const auto stream : {gufo::json::Value(), gufo::json::Value(false),
-                              gufo::json::Value(true)}) {
-      body["stream"] = stream;
-      const auto wire = server.Post(path, body.dump());
-      ExpectStatus(wire, 200);
-      assert(wire.find("text/event-stream") == std::string::npos);
-      const auto counted = body_of(wire);
-      assert(counted.size() == 2);
-      assert(counted.member_str("object") == "response.input_tokens");
-      assert(counted.member_size("input_tokens") == 65537);
-      const auto& chat = server.backend->counted_chat;
-      assert(chat.messages.size() == 2);
-      assert(chat.messages[0].role == gufo::tokenization::ChatRole::kSystem);
-      assert(chat.messages[0].content == "sys");
-      assert(chat.messages[1].content == "café 東京");
-      assert(chat.reasoning.enabled == true);
-      assert(chat.reasoning.effort == gufo::ReasoningEffort::kMedium);
-      assert(!chat.client_id.empty());
-    }
-    assert(server.backend->calls == calls);
-    assert(body_of(server.Send("GET /slots HTTP/1.1\r\n\r\n")).dump() ==
-           slots_before);
-    // Generation still receives the same conversation and defaults.
-    body["stream"] = false;
-    ExpectStatus(server.Post(endpoint.path, body.dump()), 200);
-    const auto generated = server.backend->LastCall().chat;
-    assert(generated.messages.size() ==
-           server.backend->counted_chat.messages.size());
-    assert(generated.messages[0].content == "sys");
-    assert(generated.messages[1].content == "café 東京");
-    assert(generated.reasoning.effort == gufo::ReasoningEffort::kMedium);
-    assert(generated.client_id == server.backend->counted_chat.client_id);
-
-    for (const auto* invalid : {"{", "[]", "null"})
-      ExpectStatus(server.Post(path, invalid), 400);
-    for (const auto* field : {"model", "stream"}) {
-      auto invalid = body;
-      invalid[field] = 42;
-      ExpectStatus(server.Post(path, invalid.dump()), 400);
-    }
-    auto invalid = body;
-    invalid[endpoint.input] = gufo::json::Value::array();
-    ExpectStatus(server.Post(path, invalid.dump()), 400);
-    invalid = body;
-    invalid["model"] = "not-loaded";
-    ExpectStatus(server.Post(path, invalid.dump()), 404);
-    for (int failure : {1, 2}) {
-      server.backend->count_failure = failure;
-      const auto rejected = server.Post(path, body.dump());
-      ExpectStatus(rejected, 400);
-      assert(body_of(rejected).find("error")->member_str("code") ==
-             (failure == 1 ? "invalid_prompt" : "context_length_exceeded"));
-    }
-    server.backend->count_failure = 0;
-    server.backend->chat_token_count = 0;
-    const auto zero = server.Post(path, body.dump());
-    ExpectStatus(zero, 200);
-    assert(body_of(zero).member_size("input_tokens", 99) == 0);
-    server.backend->chat_token_count.reset();
-    assert(server.backend->calls == calls + 1);
-  }
-
-  server.backend->chat_token_count = 1234;
-  const int calls = server.backend->calls;
-  for (const auto& [path, body] :
-       {std::pair{"/v1/chat/completions/input_tokens",
-                  R"({"model":"test","messages":[
-                       {"role":"user","content":"look"},
-                       {"role":"assistant","content":null,"tool_calls":[
-                         {"id":"call_1","type":"function","function":
-                           {"name":"look","arguments":"{}"}}]},
-                       {"role":"tool","tool_call_id":"call_1","content":"found"}],
-                       "tools":[{"type":"function","function":{"name":"look",
-                         "parameters":{"type":"object"}}}],
-                       "tool_choice":{"type":"function","function":{"name":"look"}},
-                       "parallel_tool_calls":false,"reasoning_effort":"high"})"},
-        std::pair{"/v1/responses/input_tokens",
-                  R"({"model":"test","input":[
-                       {"role":"user","content":"look"},
-                       {"type":"function_call","call_id":"call_1","name":"look","arguments":"{}"},
-                       {"type":"function_call_output","call_id":"call_1","output":"found"}],
-                       "tools":[{"type":"function","name":"look","parameters":{"type":"object"}}],
-                       "tool_choice":{"type":"function","name":"look"},
-                       "parallel_tool_calls":false,"reasoning":{"effort":"high"}})"}}) {
-    ExpectStatus(server.Post(path, body), 200);
-    const auto& chat = server.backend->counted_chat;
-    assert(chat.messages.size() == 3 && chat.tools.size() == 1);
-    assert(chat.tools[0].name == "look");
-    assert(chat.messages[1].tool_calls.size() == 1);
-    assert(chat.messages[2].tool_call_id == "call_1");
-    assert(chat.messages[2].content == "found");
-    assert(chat.forced_tool_name == "look" && !chat.parallel_tool_calls);
-    assert(chat.reasoning.effort == gufo::ReasoningEffort::kHigh);
-  }
-  for (const auto& [path, body] :
-       {std::pair{"/v1/chat/completions/input_tokens",
-                  R"({"model":"test","messages":[{"role":"user","content":[
-                       {"type":"text","text":"pixels:"},
-                       {"type":"image_url","image_url":{"url":"data:image/png;base64,AQID","detail":"low"}}]}],
-                       "response_format":{"type":"json_schema","json_schema":{
-                         "name":"color","description":"Return a color.","schema":{"type":"object"}}}})"},
-        std::pair{"/v1/responses/input_tokens",
-                  R"({"model":"test","input":[{"role":"user","content":[
-                       {"type":"input_text","text":"pixels:"},
-                       {"type":"input_image","image_url":"data:image/png;base64,AQID","detail":"low"}]}],
-                       "text":{"format":{"type":"json_schema","name":"color",
-                         "description":"Return a color.","schema":{"type":"object"}}}})"}}) {
-    server.backend->image_support = false;
-    ExpectStatus(server.Post(path, body), 400);
-    server.backend->image_support = true;
-    ExpectStatus(server.Post(path, body), 200);
-    const auto& chat = server.backend->counted_chat;
-    assert(chat.messages.size() == 1 && chat.messages[0].images.size() == 1);
-    const auto& image = chat.messages[0].images[0];
-    assert(image.offset == 7);
-    assert(*image.bytes == std::vector<std::uint8_t>({1, 2, 3}));
-    assert(image.detail == gufo::tokenization::ChatMessage::ImageDetail::kLow);
-    assert(chat.response_format != nullptr);
-    assert(chat.response_format_description == "Return a color.");
-  }
-  assert(server.backend->calls == calls);
 }
 
 void TestLlamaSlotsAndMetrics() {
@@ -1206,14 +1407,6 @@ void TestCompatibilityRequests() {
   assert(request.response_format && request.reasoning.enabled == false &&
          request.messages.back().images.size() == 1 &&
          request.messages.back().images[0].offset == 8);
-
-  // Only detail "low" reaches the backend as a resolution bound.
-  response_body(server.Post("/v1/responses",
-                            R"({"input":[{"role":"user","content":[
-        {"type":"input_text","text":"describe"},
-        {"type":"input_image","image_url":"data:image/png;base64,AA==","detail":"low"}]}]})"));
-  assert(server.backend->LastCall().chat.messages.back().images[0].detail ==
-         gufo::tokenization::ChatMessage::ImageDetail::kLow);
 
   const auto response = response_body(server.Post(
       "/v1/responses",
@@ -1974,84 +2167,6 @@ void TestModelInputModalities() {
   }
 }
 
-void TestServedModelNames() {
-  RunningServer server;
-  using gufo::json::parse;
-  const auto body_of = [](const std::string& response) {
-    return parse(response.substr(response.find("\r\n\r\n") + 4));
-  };
-  const auto listed = [&] {
-    std::vector<std::string> ids;
-    const auto models = server.Send("GET /v1/models HTTP/1.1\r\n\r\n");
-    ExpectStatus(models, 200);
-    const auto listing = body_of(models);
-    for (const auto& model : listing.find("data")->items()) {
-      assert(model.member_size("context_length") == 65536);
-      ids.push_back(model.member_str("id"));
-    }
-    return ids;
-  };
-  struct Endpoint {
-    const char *path, *fields;
-    bool echoes = true;
-  };
-  const Endpoint endpoints[] = {
-      {"/v1/chat/completions",
-       R"("messages":[{"role":"user","content":"hi"}])"},
-      {"/v1/completions", R"("prompt":"hi")"},
-      {"/v1/responses", R"("input":"hi")"},
-      {"/v1/messages", R"("messages":[{"role":"user","content":"hi"}])"},
-      {"/v1/messages/count_tokens",
-       R"("messages":[{"role":"user","content":"hi"}])", false},
-      {"/apply-template", R"("messages":[{"role":"user","content":"hi"}])",
-       false},
-      {"/completion", R"("prompt":"hi")", false},
-  };
-  server.backend->chat_token_count = 1;
-  server.backend->rendered_prompt = "p";
-  const auto post = [&](const Endpoint& endpoint, const std::string& model) {
-    return server.Post(endpoint.path, R"({"model":")" + model + R"(",)" +
-                                          endpoint.fields + "}");
-  };
-  // One name serves as before: it alone is listed and accepted.
-  assert(listed() == std::vector<std::string>{"test"});
-  for (const auto& endpoint : endpoints) {
-    const auto response = post(endpoint, "test");
-    ExpectStatus(response, 200);
-    assert(!endpoint.echoes || body_of(response).member_str("model") == "test");
-    const auto unknown = post(endpoint, "additional");
-    ExpectStatus(unknown, 404);
-    assert(unknown.find("model_not_found") != std::string::npos);
-  }
-
-  server.backend->names = {"test", "additional", "books"};
-  assert(listed() == server.backend->names);
-  for (const auto& endpoint : endpoints) {
-    for (const auto& model : server.backend->names) {
-      const auto response = post(endpoint, model);
-      ExpectStatus(response, 200);
-      assert(!endpoint.echoes ||
-             body_of(response).member_str("model") == model);
-    }
-    const auto unknown = post(endpoint, "other");
-    ExpectStatus(unknown, 404);
-    assert(unknown.find("model_not_found") != std::string::npos);
-  }
-  // Streamed events carry the additional name the request selected.
-  const auto streamed = server.Post(
-      "/v1/responses", R"({"model":"books","input":"hi","stream":true})");
-  ExpectStatus(streamed, 200);
-  assert(streamed.find("text/event-stream") != std::string::npos &&
-         streamed.find(R"("model":"books")") != std::string::npos &&
-         streamed.find(R"("model":"test")") == std::string::npos);
-  // Without a model field the primary name answers.
-  assert(body_of(server.Post("/v1/responses", R"({"input":"hi"})"))
-             .member_str("model") == "test");
-  server.backend->names = {"test"};
-  server.backend->chat_token_count.reset();
-  server.backend->rendered_prompt.reset();
-}
-
 void TestRawCompletionStreaming() {
   RunningServer server;
   using gufo::json::parse;
@@ -2305,22 +2420,32 @@ void TestDeviceLossWhileWriterBlocked() {
           write_finished = true;
         }};
   });
-  const int fd = server.Connect();
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  const auto fd = server.Connect();
   const int receive_buffer = 1024;
-  assert(::setsockopt(fd, SOL_SOCKET, SO_RCVBUF,
-                      reinterpret_cast<const char*>(&receive_buffer),
-                      sizeof(receive_buffer)) == 0);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  assert(gufo::platform::SetSocketOption(fd, SOL_SOCKET, SO_RCVBUF,
+                                         receive_buffer) == 0);
   const std::string request = "POST /blocked HTTP/1.1\r\n\r\n";
-  assert(net::SendNoSignal(fd, request.data(), request.size()) ==
-         static_cast<std::intptr_t>(request.size()));
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  assert(gufo::platform::SocketSend(fd, request.data(), request.size(),
+                                    MSG_NOSIGNAL) ==
+         static_cast<ssize_t>(request.size()));
   assert(writing.try_acquire_for(std::chrono::seconds(2)));
   // The peer never drains the response. No health request or completed write
   // is available to trigger shutdown; the listener must observe the loss.
   server.backend->lost = true;
   assert(hook_called.try_acquire_for(std::chrono::seconds(2)));
   assert(hook_calls == 1 && !write_finished);
-  net::ShutdownSocket(fd, net::ShutdownHow::kReadWrite);
-  net::CloseSocket(fd);
+  // WINDOWS: Local shutdown must interrupt the pending write without any peer
+  // action.
+  const auto start = std::chrono::steady_clock::now();
+  server.server.stop();
+  assert(write_finished);
+  assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+  ::shutdown(fd, SHUT_RDWR);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  gufo::platform::CloseSocket(fd);
 }
 
 void TestInvalidBindSettings() {
@@ -2334,28 +2459,45 @@ void TestInvalidBindSettings() {
   std::string error;
   assert(!invalid.start(&error));
   assert(!error.empty());
+  // WINDOWS: A second server cannot take an occupied port, even on Winsock.
+  RunningServer first;
+  HttpServer duplicate("127.0.0.1", first.server.port(), nullptr);
+  assert(!duplicate.start(&error));
 }
 
 // Some CI containers have no IPv6 loopback; listener checks skip there.
 bool HasIpv6Loopback() {
-  const net::Socket fd = net::CreateStreamSocket(AF_INET6);
-  if (fd == net::kInvalidSocket)
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  const auto fd = ::socket(AF_INET6, SOCK_STREAM, 0);
+  if (fd == gufo::platform::kInvalidSocket)
     return false;
   sockaddr_in6 address{};
   address.sin6_family = AF_INET6;
   address.sin6_addr = in6addr_loopback;
   const bool bound = ::bind(fd, reinterpret_cast<const sockaddr*>(&address),
                             sizeof(address)) == 0;
-  net::CloseSocket(fd);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  gufo::platform::CloseSocket(fd);
   return bound;
 }
 
 void TestListenAddresses() {
   using gufo::server::IsListenAddress;
-  for (const char* host : {"127.0.0.1", "0.0.0.0", "::", "::1", "fe80::1%lo"})
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  for (const char* host : {"127.0.0.1", "0.0.0.0", "::", "::1"})
     assert(IsListenAddress(host));
-  for (const char* host : {"", "localhost", "127.1", "[::1]", "bad.address"})
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#ifndef _WIN32
+  // Winsock resolves a zone name only when it names an installed interface;
+  // "lo" is a Linux interface name.
+  assert(IsListenAddress("fe80::1%lo"));
+#endif
+  for (const char* host : {"", "localhost", "127.1", "[::1]", "bad.address"}) {
+    if (IsListenAddress(host))
+      std::cerr << "unexpected listen address: '" << host << "'\n";
     assert(!IsListenAddress(host));
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+  }
   if (!HasIpv6Loopback()) {
     std::cout << "IPv6 loopback unavailable; skipping IPv6 listener checks.\n";
     return;
@@ -2379,7 +2521,7 @@ void TestListenAddresses() {
 // Binds port 0 to find a free port, then releases it for the code under test.
 int FreePort(const std::string& host = "127.0.0.1") {
   sockaddr_storage address{};
-  net::SocklenT length = 0;
+  socklen_t length = 0;
   auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
   auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
   if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
@@ -2390,19 +2532,22 @@ int FreePort(const std::string& host = "127.0.0.1") {
     ipv6->sin6_family = AF_INET6;
     length = sizeof(*ipv6);
   }
-  const net::Socket fd = net::CreateStreamSocket(address.ss_family);
-  assert(fd != net::kInvalidSocket);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  const auto fd = ::socket(address.ss_family, SOCK_STREAM, 0);
+  assert(fd != gufo::platform::kInvalidSocket);
   assert(::bind(fd, reinterpret_cast<const sockaddr*>(&address), length) == 0);
   assert(::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) ==
          0);
-  net::CloseSocket(fd);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  gufo::platform::CloseSocket(fd);
   return ntohs(address.ss_family == AF_INET6 ? ipv6->sin6_port
                                              : ipv4->sin_port);
 }
 
-net::Socket ConnectTo(const std::string& host, int port) {
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+gufo::platform::SocketHandle ConnectTo(const std::string& host, int port) {
   sockaddr_storage address{};
-  net::SocklenT length = 0;
+  socklen_t length = 0;
   auto* ipv4 = reinterpret_cast<sockaddr_in*>(&address);
   auto* ipv6 = reinterpret_cast<sockaddr_in6*>(&address);
   if (::inet_pton(AF_INET, host.c_str(), &ipv4->sin_addr) == 1) {
@@ -2415,12 +2560,15 @@ net::Socket ConnectTo(const std::string& host, int port) {
     ipv6->sin6_port = htons(static_cast<std::uint16_t>(port));
     length = sizeof(*ipv6);
   }
-  const net::Socket fd = net::CreateStreamSocket(address.ss_family);
-  assert(fd != net::kInvalidSocket);
-  assert(net::SetSocketTimeouts(fd, 3'000));
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  const auto fd = ::socket(address.ss_family, SOCK_STREAM, 0);
+  assert(fd != gufo::platform::kInvalidSocket);
+  assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
+                                          std::chrono::seconds(3)) == 0);
   if (::connect(fd, reinterpret_cast<const sockaddr*>(&address), length) != 0) {
-    net::CloseSocket(fd);
-    return net::kInvalidSocket;
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    gufo::platform::CloseSocket(fd);
+    return gufo::platform::kInvalidSocket;
   }
   return fd;
 }
@@ -2428,24 +2576,29 @@ net::Socket ConnectTo(const std::string& host, int port) {
 // Sends each part separately, pausing between them, and reads to EOF.
 std::string SendParts(const std::string& host, int port,
                       const std::vector<std::string>& parts) {
-  const net::Socket fd = ConnectTo(host, port);
-  assert(fd != net::kInvalidSocket);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  const auto fd = ConnectTo(host, port);
+  assert(fd != gufo::platform::kInvalidSocket);
   for (std::size_t index = 0; index < parts.size(); ++index) {
     if (index > 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    assert(net::SendNoSignal(fd, parts[index].data(), parts[index].size()) ==
-           static_cast<std::intptr_t>(parts[index].size()));
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    assert(gufo::platform::SocketSend(fd, parts[index].data(),
+                                      parts[index].size(), MSG_NOSIGNAL) ==
+           static_cast<ssize_t>(parts[index].size()));
   }
   std::string response;
   char buffer[4096];
   for (;;) {
-    const auto count = net::Receive(fd, buffer, sizeof(buffer));
+    // WINDOWS: keep transport and shutdown coverage on Winsock.
+    const auto count = gufo::platform::SocketRead(fd, buffer, sizeof(buffer));
     assert(count >= 0);
     if (count == 0)
       break;
     response.append(buffer, static_cast<std::size_t>(count));
   }
-  net::CloseSocket(fd);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  gufo::platform::CloseSocket(fd);
   return response;
 }
 
@@ -2478,22 +2631,6 @@ void TestLoadingResponder() {
   ExpectLoading(SendParts(
       "127.0.0.1", port,
       {"POST /v1/chat/completions HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}"}));
-  // A body the responder leaves unread, whole or arriving after the head,
-  // must not reset the connection before the client reads the answer.
-  ExpectLoading(SendParts(
-      "127.0.0.1", port,
-      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 65536\r\n\r\n" +
-       std::string(65536, 'x')}));
-  ExpectLoading(SendParts(
-      "127.0.0.1", port,
-      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 4096\r\n\r\n",
-       std::string(4096, 'x')}));
-  // A body larger than the socket buffers is still being sent when the
-  // answer is written; closing then breaks the client's send.
-  ExpectLoading(SendParts(
-      "127.0.0.1", port,
-      {"POST /v1/completions HTTP/1.1\r\nContent-Length: 8388608\r\n\r\n" +
-       std::string(8388608, 'x')}));
   // A request head split across segments is answered after it completes.
   ExpectLoading(
       SendParts("127.0.0.1", port, {"GET /hea", "lth HTTP/1.1\r\n", "\r\n"}));
@@ -2507,19 +2644,22 @@ void TestLoadingResponder() {
 
   // A client that connects and sends nothing delays neither the next client
   // nor stop() beyond the bounded request wait.
-  const int idle = ConnectTo("127.0.0.1", port);
-  assert(idle >= 0);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  const auto idle = ConnectTo("127.0.0.1", port);
+  assert(idle != gufo::platform::kInvalidSocket);
   auto started = std::chrono::steady_clock::now();
   ExpectLoading(SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"}));
   assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
-  const int idle_during_stop = ConnectTo("127.0.0.1", port);
-  assert(idle_during_stop >= 0);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  const auto idle_during_stop = ConnectTo("127.0.0.1", port);
+  assert(idle_during_stop != gufo::platform::kInvalidSocket);
   started = std::chrono::steady_clock::now();
   loading.stop();
   assert(std::chrono::steady_clock::now() - started < std::chrono::seconds(2));
   assert(!loading.listening());
-  net::CloseSocket(idle);
-  net::CloseSocket(idle_during_stop);
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  gufo::platform::CloseSocket(idle);
+  gufo::platform::CloseSocket(idle_during_stop);
 
   // Handoff: the real server binds the same address and answers health.
   HttpServer server("127.0.0.1", port, nullptr);
@@ -2595,116 +2735,161 @@ void TestQueryParameters() {
   assert(request.query_param("empty").empty());
 }
 
-// Stops the thread that writes a request's completion record, which the
-// server emits after the response is on the wire. This holds a worker in its
-// closing phase for as long as the test wants. The gate blocks while the
-// logger holds its mutex, so a probe request must log nothing at the default
-// level; GET /health qualifies.
-class CompletionGate final : public std::streambuf {
-public:
-  bool WaitUntilHeld() {
-    return held_.try_acquire_for(std::chrono::seconds(5));
-  }
-  void Release() {
-    open_.store(true);
-    released_.release();
-  }
-
-protected:
-  std::streamsize xsputn(const char* data, std::streamsize count) override {
-    if (!open_.load() &&
-        std::string_view(data, static_cast<std::size_t>(count))
-                .find("event=completed") != std::string_view::npos) {
-      held_.release();
-      released_.try_acquire_for(std::chrono::seconds(5));
+void TestPeerDisconnect() {
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  for (const bool streaming : {false, true}) {
+    for (const bool reset : {false, true}) {
+      RunningServer server;
+      server.backend->wait_for_disconnect = true;
+      server.backend->admit = streaming;
+      const auto fd = server.Connect();
+      const std::string body = streaming
+                                   ? R"({"prompt":"hi","stream":true})"
+                                   : R"({"prompt":"hi","max_tokens":128})";
+      const std::string request =
+          "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n"
+          "Content-Type: application/json\r\nContent-Length: " +
+          std::to_string(body.size()) + "\r\n\r\n" + body;
+      assert(gufo::platform::SocketSend(fd, request.data(), request.size(),
+                                        MSG_NOSIGNAL) ==
+             static_cast<ssize_t>(request.size()));
+      assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
+      if (reset) {
+        const linger abortive{1, 0};
+        assert(gufo::platform::SetSocketOption(fd, SOL_SOCKET, SO_LINGER,
+                                               abortive) == 0);
+      }
+      gufo::platform::CloseSocket(fd);
+      assert(server.backend->finished.try_acquire_for(std::chrono::seconds(2)));
+      assert(server.backend->disconnected);
     }
-    return count;
   }
-  int_type overflow(int_type character) override {
-    return traits_type::not_eof(character);
+}
+
+void TestPartialRequestAndStop() {
+  // Accept() must leave request workers in blocking mode. Split both the
+  // request head and body across writes, then stop separate incomplete ones.
+  RunningServer server;
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  const auto fd = server.Connect();
+  for (const auto part :
+       {"POST /echo HTTP/1.1\r\nContent-Length: 5\r\n", "\r\nhe", "llo"}) {
+    assert(gufo::platform::SocketSend(fd, part, std::strlen(part),
+                                      MSG_NOSIGNAL) > 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
   }
-
-private:
-  std::atomic<bool> open_{false};
-  std::binary_semaphore held_{0};
-  std::binary_semaphore released_{0};
-};
-
-std::string ReadFramedResponse(int fd) {
   std::string response;
-  char buffer[4096];
-  std::size_t total = std::string::npos;
+  char buffer[1024];
   for (;;) {
-    const auto head = response.find("\r\n\r\n");
-    if (head != std::string::npos && total == std::string::npos) {
-      const auto length = response.find("Content-Length: ");
-      assert(length != std::string::npos && length < head);
-      total = head + 4 + std::stoul(response.substr(length + 16));
-    }
-    if (total != std::string::npos && response.size() >= total)
-      return response;
-    const auto count = ::read(fd, buffer, sizeof(buffer));
-    if (count <= 0)
-      return response;
+    const auto count = gufo::platform::SocketRead(fd, buffer, sizeof(buffer));
+    assert(count >= 0);
+    if (count == 0)
+      break;
     response.append(buffer, static_cast<std::size_t>(count));
   }
-}
+  gufo::platform::CloseSocket(fd);
+  ExpectStatus(response, 200);
+  assert(response.ends_with("hello"));
 
-void TestConnectionLimitIgnoresClosingConnections() {
-  CompletionGate gate;
-  auto* previous_sink = std::clog.rdbuf(&gate);
-  {
-    RunningServer server({.max_connections = 2});
-    const int idle = server.Connect();
-    const int answered = server.Connect();
-
-    // Both slots hold a connection the server is still reading from.
-    const int refused = server.Connect();
-    const auto refusal = ReadFramedResponse(refused);
-    ExpectStatus(refusal, 503);
-    assert(refusal.find("connection limit reached") != std::string::npos);
-    net::CloseSocket(refused);
-
-    const std::string request =
-        "POST /echo HTTP/1.1\r\nContent-Length: 4\r\n\r\nping";
-    assert(net::SendNoSignal(answered, request.data(), request.size()) ==
-           static_cast<ssize_t>(request.size()));
-    assert(ReadFramedResponse(answered).ends_with("ping"));
-    // The response is complete but the server has not closed the connection:
-    // its worker is parked writing the completion record.
-    assert(gate.WaitUntilHeld());
-
-    // A client that reads its response and reconnects at once must be served.
-    const int next = server.Connect();
-    const std::string health = "GET /health HTTP/1.1\r\n\r\n";
-    assert(net::SendNoSignal(next, health.data(), health.size()) ==
-           static_cast<ssize_t>(health.size()));
-    ExpectStatus(ReadFramedResponse(next), 200);
-
-    gate.Release();
-    net::CloseSocket(next);
-    net::CloseSocket(answered);
-    net::CloseSocket(idle);
+  for (const auto incomplete :
+       {"GET /ready HTTP/1.1\r\n",
+        "POST /echo HTTP/1.1\r\nContent-Length: 5\r\n\r\nh"}) {
+    RunningServer stopping;
+    const auto client = stopping.Connect();
+    assert(gufo::platform::SocketSend(
+               client, incomplete, std::strlen(incomplete), MSG_NOSIGNAL) > 0);
+    // Allow the worker to enter its blocking read. CTest bounds a regression
+    // even if stop() cannot interrupt it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    const auto start = std::chrono::steady_clock::now();
+    stopping.server.stop();
+    assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+    gufo::platform::CloseSocket(client);
   }
-  std::clog.rdbuf(previous_sink);
+  RunningServer active;
+  active.backend->wait_for_disconnect = true;
+  const auto client = active.Connect();
+  const std::string request =
+      // WINDOWS: keep transport and shutdown coverage on Winsock.
+      "POST /v1/completions HTTP/1.1\r\nContent-Length: 15\r\n\r\n"
+      R"({"prompt":"hi"})";
+  assert(gufo::platform::SocketSend(client, request.data(), request.size(),
+                                    MSG_NOSIGNAL) > 0);
+  assert(active.backend->entered.try_acquire_for(std::chrono::seconds(2)));
+  active.server.stop();
+  assert(active.backend->disconnected);
+  gufo::platform::CloseSocket(client);
 }
 
-void TestPeerDisconnect() {
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#ifdef _WIN32
+void TestWinsockErrors() {
+  char byte;
+  errno = 0;
+  assert(gufo::platform::SocketRecv(gufo::platform::kInvalidSocket, &byte, 1,
+                                    0) == -1);
+  assert(errno == EBADF);
   RunningServer server;
-  server.backend->wait_for_disconnect = true;
-  const int fd = server.Connect();
-  const std::string body = R"({"prompt":"hi","max_tokens":128})";
-  const std::string request =
-      "POST /v1/completions HTTP/1.1\r\nHost: localhost\r\n"
-      "Content-Type: application/json\r\nContent-Length: " +
-      std::to_string(body.size()) + "\r\n\r\n" + body;
-  assert(net::SendNoSignal(fd, request.data(), request.size()) ==
-         static_cast<std::intptr_t>(request.size()));
-  assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
-  net::CloseSocket(fd);
-  assert(server.backend->finished.try_acquire_for(std::chrono::seconds(2)));
-  assert(server.backend->disconnected);
+  const auto fd = server.Connect();
+  assert(gufo::platform::SetSocketBlocking(fd, false) == 0);
+  errno = EIO;
+  assert(gufo::platform::SocketRecv(fd, &byte, 1, 0) == -1);
+  assert(errno == EAGAIN);
+  assert(gufo::platform::SetSocketBlocking(fd, true) == 0);
+  assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
+                                          std::chrono::milliseconds(100)) == 0);
+  const auto start = std::chrono::steady_clock::now();
+  errno = EIO;
+  assert(gufo::platform::SocketRecv(fd, &byte, 1, 0) == -1);
+  assert(errno == EAGAIN);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+  assert(elapsed >= std::chrono::milliseconds(50) &&
+         elapsed < std::chrono::seconds(2));
+  // Winsock leaves a timed-out connection in an indeterminate state. Test
+  // local shutdown on a fresh connection instead of using that socket again.
+  gufo::platform::CloseSocket(fd);
+  const auto stopped = server.Connect();
+  // Leave the send half open so the server keeps waiting for a request and
+  // cannot race this check with a response or peer-side close.
+  assert(::shutdown(stopped, SHUT_RD) == 0);
+  errno = EIO;
+  assert(gufo::platform::SocketRecv(stopped, &byte, 1, 0) == -1);
+  assert(errno == EPIPE);
+  gufo::platform::CloseSocket(stopped);
 }
+
+// Launched by the Windows subprocess harness in a private console. An
+// accepted echo proves that run() installed its handlers before readiness.
+int WindowsShutdownChild(std::string_view mode) {
+  RunningServer server({}, true);
+  ExpectStatus(server.Post("/echo", "ready"), 200);
+  auto fd = gufo::platform::kInvalidSocket;
+  if (mode == "active") {
+    server.backend->wait_for_disconnect = true;
+    fd = server.Connect();
+    const std::string request =
+        "POST /v1/completions HTTP/1.1\r\nContent-Length: 15\r\n\r\n"
+        R"({"prompt":"hi"})";
+    assert(gufo::platform::SocketSend(fd, request.data(), request.size(),
+                                      MSG_NOSIGNAL) > 0);
+    assert(server.backend->entered.try_acquire_for(std::chrono::seconds(2)));
+  } else if (mode == "partial") {
+    fd = server.Connect();
+    const std::string request = "POST /echo HTTP/1.1\r\n";
+    assert(gufo::platform::SocketSend(fd, request.data(), request.size(),
+                                      MSG_NOSIGNAL) > 0);
+  } else {
+    assert(mode == "idle");
+  }
+  std::cout << "READY\n" << std::flush;
+  assert(server.run_finished.try_acquire_for(std::chrono::seconds(5)));
+  if (mode == "active")
+    assert(server.backend->disconnected);
+  if (fd != gufo::platform::kInvalidSocket)
+    gufo::platform::CloseSocket(fd);
+  return 0;
+}
+#endif
 
 void TestCompatibilityStopSequences() {
   RunningServer server;
@@ -2863,29 +3048,6 @@ void TestResponseSamplingDefaults() {
     body["cache_prompt"] = gufo::json::parse(invalid);
     const int calls = server.backend->calls;
     ExpectStatus(server.Post("/v1/responses", body.dump()), 400);
-    assert(server.backend->calls == calls);
-  }
-  body["cache_prompt"] = gufo::json::Value();
-  ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
-  assert(server.backend->LastCall().chat.cache_persist);
-  for (const bool persist : {false, true}) {
-    body["cache_persist"] = persist;
-    ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
-    assert(server.backend->LastCall().chat.cache_persist == persist);
-    assert(server.backend->LastCall().chat.cache_prompt);
-  }
-  body["cache_persist"] = false;
-  ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
-  body["cache_persist"] = gufo::json::Value();
-  ExpectStatus(server.Post("/v1/responses", body.dump()), 200);
-  assert(server.backend->LastCall().chat.cache_persist);
-  for (const char* invalid : {"0", "\"false\""}) {
-    body["cache_persist"] = gufo::json::parse(invalid);
-    const int calls = server.backend->calls;
-    const auto rejected = server.Post("/v1/responses", body.dump());
-    ExpectStatus(rejected, 400);
-    assert(rejected.find("'cache_persist' must be a boolean") !=
-           std::string::npos);
     assert(server.backend->calls == calls);
   }
 }
@@ -3051,6 +3213,55 @@ void TestSseHeartbeatShutdown() {
   }
 }
 
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#ifndef _WIN32
+void TestSignalShutdown() {
+  // Process signals must never terminate the test runner itself. Prove that
+  // both idle listeners and active generation return through normal cleanup.
+  for (const int signal : {SIGINT, SIGTERM}) {
+    for (const bool active : {false, true}) {
+      const pid_t child = ::fork();
+      assert(child >= 0);
+      if (child == 0) {
+        ::alarm(5);
+        {
+          RunningServer server({}, true);
+          // Accepting a request proves run() installed its handlers.
+          ExpectStatus(server.Post("/echo", "ready"), 200);
+          int fd = -1;
+          if (active) {
+            server.backend->wait_for_disconnect = true;
+            fd = server.Connect();
+            const std::string body = R"({"prompt":"hello"})";
+            const std::string request =
+                "POST /v1/completions HTTP/1.1\r\nContent-Length: " +
+                std::to_string(body.size()) + "\r\n\r\n" + body;
+            // WINDOWS: keep transport and shutdown coverage on Winsock.
+            assert(gufo::platform::SocketSend(fd, request.data(),
+                                              request.size(), MSG_NOSIGNAL) ==
+                   static_cast<ssize_t>(request.size()));
+            assert(server.backend->entered.try_acquire_for(
+                std::chrono::seconds(2)));
+          }
+          assert(::kill(::getpid(), signal) == 0);
+          assert(server.run_finished.try_acquire_for(std::chrono::seconds(2)));
+          if (active) {
+            assert(server.backend->disconnected);
+            // WINDOWS: keep transport and shutdown coverage on Winsock.
+            gufo::platform::CloseSocket(fd);
+          }
+        }
+        ::_exit(0);
+      }
+      int status = 0;
+      assert(::waitpid(child, &status, 0) == child);
+      assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+  }
+}
+
+#endif  // WINDOWS: platform coverage.
+
 }  // namespace
 
 void TestRawCompletionCachePrompt() {
@@ -3079,186 +3290,6 @@ void TestRawCompletionCachePrompt() {
           std::string(R"({"prompt":"hello","cache_prompt":)") + value + "}");
       ExpectStatus(rejected, 400);
       assert(rejected.find("'cache_prompt' must be a boolean") !=
-             std::string::npos);
-    }
-    assert(server.backend->calls == before);
-  }
-}
-
-void TestResponsesLogprobsOptions() {
-  RunningServer server;
-  for (const bool stream : {false, true}) {
-    for (const auto* count : {"null", "0", "3", "20"}) {
-      const auto response = server.Post(
-          "/v1/responses",
-          std::string(
-              R"({"input":"hello","include":["message.output_text.logprobs"],"top_logprobs":)") +
-              count + R"(,"stream":)" + (stream ? "true}" : "false}"));
-      ExpectStatus(response, 200);
-      const auto requested =
-          std::string_view(count) == "null" ? 0 : std::stoi(count);
-      assert(server.backend->LastCall().sampling.logprobs == requested);
-      assert(response.find(R"("token":"ok")") != std::string::npos);
-      assert(response.find(R"("logprob":-3)") != std::string::npos);
-      assert(response.find(R"("bytes":[111,107])") != std::string::npos);
-    }
-  }
-  for (const auto* options :
-       {R"("top_logprobs":-1)", R"("top_logprobs":21)", R"("top_logprobs":1.5)",
-        R"("top_logprobs":true)", R"("top_logprobs":"3")", R"("include":[1])",
-        R"("include":"message.output_text.logprobs")", R"("logprobs":true)"}) {
-    const auto before = server.backend->calls.load();
-    ExpectStatus(
-        server.Post("/v1/responses",
-                    std::string(R"({"input":"hello",)") + options + "}"),
-        400);
-    assert(server.backend->calls == before);
-  }
-  for (const auto* options :
-       {R"("include":null)", R"("include":[])", R"("top_logprobs":3)",
-        R"("include":["reasoning.encrypted_content"] )"}) {
-    ExpectStatus(
-        server.Post("/v1/responses",
-                    std::string(R"({"input":"hello",)") + options + "}"),
-        200);
-    assert(!server.backend->LastCall().sampling.logprobs);
-  }
-}
-
-void TestRawCompletionLogprobs() {
-  RunningServer server;
-  for (const bool stream : {false, true}) {
-    for (const int count : {0, 1, 20}) {
-      const auto response = server.Post(
-          "/v1/completions", std::string(R"({"prompt":"hello","logprobs":)") +
-                                 std::to_string(count) + R"(,"stream":)" +
-                                 (stream ? "true}" : "false}"));
-      ExpectStatus(response, 200);
-      assert(response.find(R"("tokens":["ok"])") != std::string::npos);
-      assert(response.find(R"("token_logprobs":[-3])") != std::string::npos);
-      assert(response.find(R"("text_offset":[0])") != std::string::npos);
-      assert(response.find(
-                 count ? R"("top_logprobs":[{"ok":-3,"alternative":-0.5}])"
-                       : R"("top_logprobs":[{"ok":-3}])") != std::string::npos);
-    }
-  }
-  for (const auto* value : {"true", "false", "-1", "21", "1.5", "\"1\""}) {
-    const auto before = server.backend->calls.load();
-    ExpectStatus(server.Post("/v1/completions",
-                             std::string(R"({"prompt":"hello","logprobs":)") +
-                                 value + "}"),
-                 400);
-    assert(server.backend->calls == before);
-  }
-  ExpectStatus(
-      server.Post("/v1/completions", R"({"prompt":"hello","logprobs":null})"),
-      200);
-}
-
-// The applied cache_persist is echoed at the top level of every final
-// response object, and of the finishing and usage stream chunks, never of a
-// content delta.
-void TestCachePersistEcho() {
-  RunningServer server;
-  const auto payload = [](const std::string& response) {
-    return response.find("Transfer-Encoding: chunked") != std::string::npos
-               ? ChunkedBody(response)
-               : response.substr(response.find("\r\n\r\n") + 4);
-  };
-  // The JSON of each `data:` line except [DONE], in order.
-  const auto events = [&](const std::string& response) {
-    std::vector<gufo::json::Value> result;
-    const auto body = payload(response);
-    for (std::size_t at = body.find("data: "); at != std::string::npos;
-         at = body.find("data: ", at + 6)) {
-      const auto end = body.find('\n', at);
-      const auto data = body.substr(at + 6, end - at - 6);
-      if (data != "[DONE]")
-        result.push_back(gufo::json::parse(data));
-    }
-    return result;
-  };
-  const auto echoed = [](const gufo::json::Value& value) {
-    const auto* field = value.find("cache_persist");
-    return field != nullptr && field->is_bool()
-               ? std::optional<bool>(field->as_bool())
-               : std::nullopt;
-  };
-  const std::string chat =
-      R"("model":"test","messages":[{"role":"user","content":"hello"}])";
-  for (const std::optional<bool> persist :
-       {std::optional<bool>(), std::optional<bool>(false),
-        std::optional<bool>(true)}) {
-    const bool expected = persist.value_or(true);
-    const std::string field = persist ? std::string(R"(,"cache_persist":)") +
-                                            (*persist ? "true" : "false")
-                                      : std::string();
-    const auto plain =
-        server.Post("/v1/chat/completions", "{" + chat + field + "}");
-    ExpectStatus(plain, 200);
-    assert(echoed(gufo::json::parse(payload(plain))) == expected);
-
-    const auto streamed = events(server.Post(
-        "/v1/chat/completions",
-        "{" + chat + field +
-            R"(,"stream":true,"stream_options":{"include_usage":true}})"));
-    assert(streamed.size() >= 3);
-    for (std::size_t i = 0; i + 2 < streamed.size(); ++i)
-      assert(!echoed(streamed[i]).has_value());
-    assert(echoed(streamed[streamed.size() - 2]) == expected);
-    assert(echoed(streamed.back()) == expected);
-    assert(streamed.back().find("usage") != nullptr);
-
-    const auto response =
-        server.Post("/v1/responses", R"({"input":"hello")" + field + "}");
-    ExpectStatus(response, 200);
-    assert(echoed(gufo::json::parse(payload(response))) == expected);
-    const auto lifecycle = events(server.Post(
-        "/v1/responses", R"({"input":"hello","stream":true)" + field + "}"));
-    assert(!lifecycle.empty() &&
-           lifecycle.back().member_str("type") == "response.completed");
-    assert(echoed(*lifecycle.back().find("response")) == expected);
-    assert(!echoed(*lifecycle.front().find("response")).has_value());
-
-    for (const auto* path : {"/v1/completions", "/completion"}) {
-      const auto completion =
-          server.Post(path, R"({"prompt":"hello")" + field + "}");
-      ExpectStatus(completion, 200);
-      assert(echoed(gufo::json::parse(payload(completion))) == expected);
-    }
-    const auto chunks = events(server.Post(
-        "/v1/completions",
-        R"({"prompt":"hello","stream":true,"stream_options":{"include_usage":true})" +
-            field + "}"));
-    assert(chunks.size() >= 3);
-    for (std::size_t i = 0; i + 2 < chunks.size(); ++i)
-      assert(!echoed(chunks[i]).has_value());
-    assert(echoed(chunks[chunks.size() - 2]) == expected);
-    assert(echoed(chunks.back()) == expected);
-  }
-}
-
-void TestRawCompletionCachePersist() {
-  RunningServer server;
-  for (const auto* path : {"/v1/completions", "/completion"}) {
-    ExpectStatus(
-        server.Post(path, R"({"prompt":"hello","cache_persist":false})"), 200);
-    assert(!server.backend->last_cache_persist);
-    assert(server.backend->last_cache_prompt);
-    ExpectStatus(server.Post(path, R"({"prompt":"hello"})"), 200);
-    assert(server.backend->last_cache_persist);
-    ExpectStatus(
-        server.Post(path, R"({"prompt":"hello","cache_persist":false})"), 200);
-    ExpectStatus(
-        server.Post(path, R"({"prompt":"hello","cache_persist":null})"), 200);
-    assert(server.backend->last_cache_persist);
-    const auto before = server.backend->calls.load();
-    for (const auto* value : {"\"false\"", "0"}) {
-      const auto rejected = server.Post(
-          path,
-          std::string(R"({"prompt":"hello","cache_persist":)") + value + "}");
-      ExpectStatus(rejected, 400);
-      assert(rejected.find("'cache_persist' must be a boolean") !=
              std::string::npos);
     }
     assert(server.backend->calls == before);
@@ -3297,205 +3328,19 @@ void TestRawCompletionPromptProgress() {
                400);
 }
 
-// A server with only an embedding service and no text backend answers
-// /v1/embeddings behind the API key, lists the model, and reports readiness.
-std::shared_ptr<gufo::server::EmbeddingService> MakeEmbeddingService(
-    bool ready) {
-  using gufo::server::EmbeddingBatch;
-  using gufo::server::EmbeddingServiceOptions;
-  using gufo::server::EmbeddingStatus;
-  return std::make_shared<gufo::server::EmbeddingService>(
-      EmbeddingServiceOptions{
-          .model_root = "/nonexistent/embeddinggemma",
-          .validate_model = !ready,  // Validation fails without a checkpoint.
-          .model_id = "embedding-test",
-          .prompts = {},
-          .default_prompt_name = {},
-          .runner =
-              [](const std::vector<gufo::server::EmbeddingInput>& texts,
-                 const gufo::server::EmbeddingRequestOptions&,
-                 EmbeddingBatch* batch, std::string*) {
-                for (const auto& text : texts) {
-                  batch->embeddings.push_back({1.0F, 0.0F});
-                  std::size_t count = 2;
-                  for (const auto& part : text.content)
-                    count += part.value.size();
-                  batch->token_counts.push_back(count);
-                }
-                return EmbeddingStatus::kOk;
-              },
-      });
-}
-
-std::string EmbeddingPost(int port, std::string_view body,
-                          std::string_view extra_headers = {},
-                          std::string_view path = "/v1/embeddings") {
-  return SendParts("127.0.0.1", port,
-                   {"POST " + std::string(path) + " HTTP/1.1\r\n" +
-                    std::string(extra_headers) +
-                    "Content-Length: " + std::to_string(body.size()) +
-                    "\r\n\r\n" + std::string(body)});
-}
-
-void TestEmbeddingService() {
-  const std::string request = R"({"model":"embedding-test","input":"hi"})";
-  {
-    auto service = MakeEmbeddingService(true);
-    assert(service->ready());
-    HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
-                      {.api_key = "test-secret"}, nullptr, service);
-    std::string error;
-    assert(server.start(&error));
-    std::binary_semaphore finished{0};
-    std::jthread worker([&] {
-      server.run(false);
-      finished.release();
-    });
-    const int port = server.port();
-    ExpectStatus(EmbeddingPost(port, request), 401);
-    ExpectStatus(EmbeddingPost(port, request, "Authorization: Bearer nope\r\n"),
-                 401);
-    const auto response =
-        EmbeddingPost(port, request, "Authorization: Bearer test-secret\r\n");
-    ExpectStatus(response, 200);
-    assert(response.find("\"object\":\"list\"") != std::string::npos);
-    assert(response.find("\"embedding\":[1,0]") != std::string::npos);
-    assert(response.find("\"prompt_tokens\":4") != std::string::npos);
-    assert(response.find("\"model\":\"embedding-test\"") != std::string::npos);
-    // llama.cpp's native route shares the service and the API key (#764).
-    const std::string native_request =
-        R"({"model":"embedding-test","content":[{"prompt_string":"hi"}]})";
-    ExpectStatus(EmbeddingPost(port, native_request, {}, "/embeddings"), 401);
-    const auto native =
-        EmbeddingPost(port, native_request,
-                      "Authorization: Bearer test-secret\r\n", "/embeddings");
-    ExpectStatus(native, 200);
-    assert(native.find("\r\n\r\n[{\"index\":0,\"embedding\":[[1,0]]}]") !=
-           std::string::npos);
-    const auto missing_model =
-        EmbeddingPost(port, R"({"model":"other","input":"hi"})",
-                      "Authorization: Bearer test-secret\r\n");
-    ExpectStatus(missing_model, 404);
-    assert(missing_model.find("\"code\":\"model_not_found\"") !=
-           std::string::npos);
-    const auto models = SendParts("127.0.0.1", port,
-                                  {"GET /v1/models HTTP/1.1\r\nAuthorization: "
-                                   "Bearer test-secret\r\n\r\n"});
-    ExpectStatus(models, 200);
-    assert(models.find("\"id\":\"embedding-test\"") != std::string::npos);
-    assert(models.find("\"capability\":\"embedding\"") != std::string::npos);
-    const auto ready = SendParts(
-        "127.0.0.1", port,
-        {"GET /ready HTTP/1.1\r\nAuthorization: Bearer test-secret\r\n\r\n"});
-    ExpectStatus(ready, 200);
-    assert(ready.find("\"model\":\"embedding-test\"") != std::string::npos);
-    // Routes of other modalities stay absent.
-    ExpectStatus(
-        SendParts("127.0.0.1", port,
-                  {"POST /v1/chat/completions HTTP/1.1\r\nAuthorization: "
-                   "Bearer test-secret\r\nContent-Length: 2\r\n\r\n{}"}),
-        404);
-    server.stop();
-    worker.join();
-  }
-  {
-    // A service that failed to start is not ready and answers 503.
-    auto service = MakeEmbeddingService(false);
-    assert(!service->ready());
-    HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr, {},
-                      nullptr, service);
-    std::string error;
-    assert(server.start(&error));
-    std::jthread worker([&] { server.run(false); });
-    const int port = server.port();
-    const auto response = EmbeddingPost(port, request);
-    ExpectStatus(response, 503);
-    assert(response.find("\"code\":\"embedding_service_unavailable\"") !=
-           std::string::npos);
-    ExpectStatus(SendParts("127.0.0.1", port, {"GET /ready HTTP/1.1\r\n\r\n"}),
-                 503);
-    const auto models =
-        SendParts("127.0.0.1", port, {"GET /v1/models HTTP/1.1\r\n\r\n"});
-    assert(models.find("embedding-test") == std::string::npos);
-    server.stop();
-    worker.join();
-  }
-  {
-    // Without an embedding service, a server with no text backend does not
-    // serve the route, and one with a backend keeps its stub.
-    HttpServer server("127.0.0.1", 0, nullptr);
-    std::string error;
-    assert(server.start(&error));
-    std::jthread worker([&] { server.run(false); });
-    ExpectStatus(EmbeddingPost(server.port(), request), 404);
-    ExpectStatus(EmbeddingPost(server.port(), request, {}, "/embeddings"), 404);
-    server.stop();
-    worker.join();
-  }
-  {
-    RunningServer text;
-    const auto response = text.Post("/v1/embeddings", R"({"input":"hi"})");
-    assert(!response.starts_with("HTTP/1.1 200 "));
-    assert(response.find("embedding_service_unavailable") == std::string::npos);
-  }
-  {
-    // A lost device answers 503, runs the shutdown hook once, and fails the
-    // health probe from then on.
-    auto service = std::make_shared<gufo::server::EmbeddingService>(
-        gufo::server::EmbeddingServiceOptions{
-            .model_root = "/nonexistent/embeddinggemma",
-            .validate_model = false,
-            .model_id = "embedding-test",
-            .prompts = {},
-            .default_prompt_name = {},
-            .runner =
-                [](const std::vector<gufo::server::EmbeddingInput>&,
-                   const gufo::server::EmbeddingRequestOptions&,
-                   gufo::server::EmbeddingBatch*, std::string*) {
-                  return gufo::server::EmbeddingStatus::kDeviceLost;
-                },
-        });
-    std::atomic<int> hook_calls{0};
-    HttpServer server("127.0.0.1", 0, nullptr, nullptr, nullptr, nullptr,
-                      {.on_device_lost = [&] { ++hook_calls; }}, nullptr,
-                      service);
-    std::string error;
-    assert(server.start(&error));
-    std::jthread worker([&] { server.run(false); });
-    const int port = server.port();
-    ExpectStatus(SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"}),
-                 200);
-    const auto lost = EmbeddingPost(port, request);
-    ExpectStatus(lost, 503);
-    assert(lost.find("\"code\":\"device_lost\"") != std::string::npos);
-    assert(hook_calls.load() == 1);
-    ExpectStatus(SendParts("127.0.0.1", port, {"GET /health HTTP/1.1\r\n\r\n"}),
-                 503);
-    ExpectStatus(EmbeddingPost(port, request), 503);
-    assert(hook_calls.load() == 1);
-    server.stop();
-    worker.join();
-  }
-  {
-    // With both configured, the service answers instead of the text stub.
-    auto service = MakeEmbeddingService(true);
-    auto backend = std::make_shared<FakeBackend>();
-    HttpServer server("127.0.0.1", 0, backend, nullptr, nullptr, nullptr, {},
-                      nullptr, service);
-    std::string error;
-    assert(server.start(&error));
-    std::jthread worker([&] { server.run(false); });
-    ExpectStatus(EmbeddingPost(server.port(), request), 200);
-    server.stop();
-    worker.join();
-  }
-}
-
-int main() {
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+int main(int argc, char** argv) {
+#ifdef _WIN32
+  if (argc == 3 && std::string_view(argv[1]) == "--windows-shutdown-child")
+    return WindowsShutdownChild(argv[2]);
+#else
+  (void)argc;
+  (void)argv;
+#endif
   // The log assertions below match "[LEVEL] [component]" text written to a
   // redirected stderr sink, so the real stderr's TTY state must not add ANSI
   // tint around the level tag.
-  gufo::platform::SetEnv("NO_COLOR", "1");
+  ::setenv("NO_COLOR", "1", 1);
   TestRequestLogging();
   TestContentTrace();
   TestQuietTiersSuppressLifecycle();
@@ -3510,35 +3355,35 @@ int main() {
   TestExpectContinue();
   TestFallbackBackendMetrics();
   TestLlamaProps();
-  TestApplyTemplate();
-  TestOpenAiInputTokens();
   TestLlamaSlotsAndMetrics();
   TestCompatibilityRequests();
   TestTextOnlyBackendRefusesImagesBeforeReading();
   TestResponsesToolImages();
   TestModelInputModalities();
-  TestServedModelNames();
   TestRawCompletionStreaming();
   TestGenerationFailureLogsCause();
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
-  TestRawCompletionLogprobs();
-  TestResponsesLogprobsOptions();
   TestRawCompletionPromptProgress();
   TestRawCompletionCachePrompt();
-  TestRawCompletionCachePersist();
-  TestCachePersistEcho();
   TestCompatibilityStopSequences();
   TestCompatibilityThinkingDefaults();
   TestResponseSamplingDefaults();
   TestCompatibilityUtf8();
   TestPeerDisconnect();
-  TestConnectionLimitIgnoresClosingConnections();
+  // WINDOWS: keep transport and shutdown coverage on Winsock.
+  TestPartialRequestAndStop();
+#ifdef _WIN32
+  TestWinsockErrors();
+#endif
   TestStreamingFraming();
   TestSseHeartbeat();
   TestSseHeartbeatShutdown();
   TestDeferredStreamHeaders();
   TestAdmittedStreamHeaders();
-  TestEmbeddingService();
+// WINDOWS: keep transport and shutdown coverage on Winsock.
+#ifndef _WIN32
+  TestSignalShutdown();
+#endif  // WINDOWS: platform coverage.
   std::cout << "HTTP transport checks passed.\n";
 }

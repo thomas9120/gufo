@@ -1,5 +1,11 @@
 #include "src/cli/serve/trace.hpp"
 
+#include <fcntl.h>
+#ifdef _WIN32
+#include <sys/stat.h>
+#endif
+#include <unistd.h>
+
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -7,15 +13,11 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
-#include <filesystem>
 #include <mutex>
 #include <string>
-#include <system_error>
 #include <utility>
 
 #include "src/cli/serve/logging.hpp"
-#include "src/core/platform/fs.hpp"
-#include "src/core/platform/os_info.hpp"
 #include "src/core/utf8.hpp"
 
 namespace gufo::server {
@@ -28,8 +30,8 @@ std::mutex& TraceMutex() {
 
 // Guarded by TraceMutex. `Enabled()` reads the flag below instead, so call
 // sites that only ask whether to build a record never contend for the lock.
-platform::PlatformFile& TraceFd() {
-  static platform::PlatformFile fd = platform::kInvalidFile;
+int& TraceFd() {
+  static int fd = -1;
   return fd;
 }
 
@@ -60,9 +62,7 @@ std::string CurrentTimestamp() {
                           .count() %
                       1000;
   std::tm calendar{};
-  if (!gufo::platform::LocalTime(seconds, &calendar)) {
-    return std::to_string(seconds);
-  }
+  ::localtime_r(&seconds, &calendar);
   std::array<char, 40> buffer{};
   const auto written = std::strftime(buffer.data(), buffer.size(),
                                      "%Y-%m-%d %H:%M:%S", &calendar);
@@ -75,15 +75,26 @@ std::string CurrentTimestamp() {
 }  // namespace
 
 std::optional<std::string> Trace::Open(const std::string& path) {
-  std::error_code ec;
-  const platform::PlatformFile fd =
-      platform::OpenForAppend(std::filesystem::path(path), ec);
-  if (fd == platform::kInvalidFile) {
-    return ec.message();
+  int flags = O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC;
+#ifdef _WIN32
+  flags |= O_NOFOLLOW;
+#endif
+  const int fd = ::open(path.c_str(), flags, S_IRUSR | S_IWUSR);
+  if (fd < 0) {
+    return std::string(std::strerror(errno));
   }
+#ifdef _WIN32
+  struct stat status{};
+  if (fstat(fd, &status) != 0 || !S_ISREG(status.st_mode) ||
+      status.st_uid != geteuid() || (status.st_mode & 0077) != 0 ||
+      status.st_nlink != 1) {
+    ::close(fd);
+    return "Windows content trace requires a private owned regular file";
+  }
+#endif
   const std::lock_guard lock(TraceMutex());
-  if (TraceFd() != platform::kInvalidFile) {
-    platform::CloseFile(TraceFd());
+  if (TraceFd() >= 0) {
+    ::close(TraceFd());
   }
   TraceFd() = fd;
   TraceEnabled().store(true, std::memory_order_release);
@@ -93,9 +104,9 @@ std::optional<std::string> Trace::Open(const std::string& path) {
 void Trace::Close() {
   const std::lock_guard lock(TraceMutex());
   TraceEnabled().store(false, std::memory_order_release);
-  if (TraceFd() != platform::kInvalidFile) {
-    platform::CloseFile(TraceFd());
-    TraceFd() = platform::kInvalidFile;
+  if (TraceFd() >= 0) {
+    ::close(TraceFd());
+    TraceFd() = -1;
   }
 }
 
@@ -129,39 +140,37 @@ void Trace::Write(const json::Value& record) {
   // concurrently. A failed write drops the record rather than stalling a
   // request on a full disk.
   const std::lock_guard lock(TraceMutex());
-  const platform::PlatformFile fd = TraceFd();
-  if (fd == platform::kInvalidFile) {
+  const int fd = TraceFd();
+  if (fd < 0) {
     return;
   }
   // Every writer holds the lock, so the record starts at the current end. A
   // pipe or terminal cannot seek, and a torn record there cannot be undone.
-  std::error_code ec;
-  const std::uint64_t start = platform::SeekToEnd(fd, ec);
-  const bool seeked = !ec;
+  const off_t start = ::lseek(fd, 0, SEEK_END);
   std::string_view pending = text;
   while (!pending.empty()) {
-    const std::size_t written =
-        platform::Write(fd, pending.data(), pending.size(), ec);
-    if (written == 0 && ec == std::errc::interrupted) {
+    const ssize_t written = ::write(fd, pending.data(), pending.size());
+    if (written < 0 && errno == EINTR) {
       continue;
     }
-    if (written == 0) {
-      const std::string reason = ec ? ec.message() : "short write";
+    if (written <= 0) {
+      const std::string reason =
+          written < 0 ? std::strerror(errno) : "short write";
       // A torn prefix would join the next record into one invalid line, so it
       // is cut back to the record's start. A sink that cannot be cut back
       // would corrupt every later record, and is closed instead.
       if (pending.size() == text.size() ||
-          (seeked && platform::Truncate(fd, start, ec))) {
+          (start >= 0 && ::ftruncate(fd, start) == 0)) {
         ReportWriteFailure(reason);
         return;
       }
-      platform::CloseFile(fd);
-      TraceFd() = platform::kInvalidFile;
+      ::close(fd);
+      TraceFd() = -1;
       TraceEnabled().store(false, std::memory_order_release);
       Logger::Warn("trace", "event=trace_disabled reason=" + reason);
       return;
     }
-    pending.remove_prefix(written);
+    pending.remove_prefix(static_cast<std::size_t>(written));
   }
 }
 

@@ -20,7 +20,7 @@
 #endif
 
 namespace gufo::platform {
-#if defined(_WIN32) && !defined(__HIP_DEVICE_COMPILE__)
+#if defined(_WIN32)
 namespace detail {
 
 inline int PrefaultExceptionFilter(EXCEPTION_POINTERS* exception,
@@ -39,18 +39,36 @@ inline int PrefaultExceptionFilter(EXCEPTION_POINTERS* exception,
   return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// WINDOWS: clang only keeps an SEH scope around calls that may throw, so a
+// __try holding bare loads never catches the fault (-fasync-exceptions would
+// change codegen everywhere). Touch pages through a volatile function pointer.
+inline std::uint8_t ReadMappedByte(const volatile std::uint8_t* address) {
+  return *address;
+}
+inline std::uint8_t (*volatile read_mapped_byte)(const volatile std::uint8_t*) =
+    ReadMappedByte;
+
 // Keep SEH in a helper with no C++ objects requiring stack unwinding. Faults
 // must be caught on the worker that touches the mapping, before joining it.
 inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
                               std::size_t page_size) noexcept {
   DWORD error = ERROR_SUCCESS;
+#if defined(__HIP_DEVICE_COMPILE__)
+  // WINDOWS: HIP .hip files include this header; clang's gfx1151 device pass
+  // rejects SEH. This host-only helper is never emitted for the device.
+  static_cast<void>(begin);
+  static_cast<void>(bytes);
+  static_cast<void>(page_size);
+#else
   __try {
     const auto* touch = reinterpret_cast<volatile const std::uint8_t*>(begin);
+    const auto read = read_mapped_byte;  // WINDOWS: keep a call in the scope.
     for (std::size_t i = 0; i < bytes; i += page_size)
-      static_cast<void>(touch[i]);
+      static_cast<void>(read(touch + i));  // WINDOWS: not a bare load.
   } __except (PrefaultExceptionFilter(GetExceptionInformation(), begin, bytes,
                                       &error)) {
   }
+#endif  // WINDOWS: __HIP_DEVICE_COMPILE__
   return error;
 }
 
@@ -65,13 +83,6 @@ inline DWORD TouchMappedPages(std::uintptr_t begin, std::size_t bytes,
 /// asks the memory manager to prefetch the range into the standby list and
 /// then touches pages in parallel so failures surface before registration.
 inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
-#if defined(__HIP_DEVICE_COMPILE__)
-  // Host-only population never runs in a device pass of a .hip translation
-  // unit; the device pass only needs this declaration to parse.
-  static_cast<void>(data);
-  static_cast<void>(bytes);
-  return;
-#else
   if (bytes == 0)
     return;
 #if defined(_WIN32)
@@ -139,28 +150,6 @@ inline void PrefaultMappedRange(const void* data, std::size_t bytes) {
                             "cannot read mapped weights");
 #endif
   }
-#endif  // !__HIP_DEVICE_COMPILE__
-}
-
-/// Drop this process's resident pages of a read-only file mapping once its
-/// contents have been copied elsewhere (device upload done and synchronized).
-/// The mapping stays valid: a later read refaults the page from the file, so
-/// this is safe even if a host read remains. Never call it on a range that is
-/// hipHostRegister'ed, where the mapping is the GPU-visible weight memory.
-/// Best effort: failures are ignored, and it is a no-op on Windows.
-inline void ReleaseMappedPages(const void* data, std::size_t bytes) noexcept {
-#if !defined(__HIP_DEVICE_COMPILE__) && !defined(_WIN32)
-  const long page_size = ::sysconf(_SC_PAGESIZE);
-  if (!data || bytes == 0 || page_size <= 0)
-    return;
-  const auto address = reinterpret_cast<std::uintptr_t>(data);
-  const auto skip = address % static_cast<std::size_t>(page_size);
-  (void)::madvise(reinterpret_cast<void*>(address - skip), bytes + skip,
-                  MADV_DONTNEED);
-#else
-  static_cast<void>(data);
-  static_cast<void>(bytes);
-#endif
 }
 
 }  // namespace gufo::platform

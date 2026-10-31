@@ -1,3 +1,4 @@
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -13,7 +14,6 @@
 #include <string>
 #include <vector>
 
-#include "src/core/platform/os_info.hpp"
 #include "src/models/minimax_h3/generation.hpp"
 #include "src/models/minimax_h3/json.hpp"
 
@@ -253,8 +253,7 @@ void TestPresetsAndReports() {
 void TestAtomicFrames() {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
-      ("gufo-h3-generation-test-" +
-       std::to_string(gufo::platform::ProcessId()));
+      ("gufo-h3-generation-test-" + std::to_string(getpid()));
   const std::filesystem::path target = root / "frames";
   std::error_code ignored;
   std::filesystem::remove_all(root, ignored);
@@ -307,7 +306,7 @@ void TestAtomicFrames() {
 void TestAtomicLatents() {
   const std::filesystem::path root =
       std::filesystem::temp_directory_path() /
-      ("gufo-h3-latent-test-" + std::to_string(gufo::platform::ProcessId()));
+      ("gufo-h3-latent-test-" + std::to_string(getpid()));
   const std::filesystem::path target = root / "latents";
   std::error_code ignored;
   std::filesystem::remove_all(root, ignored);

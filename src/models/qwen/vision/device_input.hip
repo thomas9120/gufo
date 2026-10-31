@@ -29,18 +29,6 @@ DeviceInput::~DeviceInput() {
     (void)hipFree(positions_);
 }
 
-void DeviceInput::PrepareRope(hipStream_t stream) {
-  if (descriptor_ != nullptr)
-    return;
-  if (continuation_hooks_)
-    continuation_hooks_->BeforeVision(nullptr, &layout_);
-  Check(hipMalloc(&descriptor_, sizeof(DeviceRope)));
-  const DeviceRope descriptor{};
-  Check(hipMemcpyAsync(descriptor_, &descriptor, sizeof(descriptor),
-                       hipMemcpyHostToDevice, stream));
-  Check(hipStreamSynchronize(stream));
-}
-
 void DeviceInput::Configure(std::shared_ptr<const Prompt> prompt,
                             std::shared_ptr<Encoder> encoder,
                             hipStream_t stream) {

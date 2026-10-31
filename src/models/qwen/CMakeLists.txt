@@ -62,7 +62,6 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/ssm_row_split.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/swiglu.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_batched.hip
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/verify_gemm_27b.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_verify_wave64.hip
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/kernels/attention_decode_graph.hip
@@ -79,7 +78,6 @@ if (ENGINE_ENABLE_HIP)
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/model_loader.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prefill_chunk.cpp
-    ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/prompt_hidden_buffer.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/ssm_replay.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/mtp/model.cpp
     ${PROJECT_SOURCE_DIR}/src/models/qwen/hip/mtp/executor.cpp
@@ -120,7 +118,4 @@ if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
   add_executable(qwen27b_continuation_probe EXCLUDE_FROM_ALL
     ${PROJECT_SOURCE_DIR}/tests/models/qwen27b/continuation_probe.cpp)
   target_link_libraries(qwen27b_continuation_probe PRIVATE gufo_core)
-  add_executable(qwen27b_verify_sweep EXCLUDE_FROM_ALL
-    ${PROJECT_SOURCE_DIR}/tools/qwen27b/verify_sweep/sweep.hip)
-  target_link_libraries(qwen27b_verify_sweep PRIVATE gufo_core hip::device)
 endif()

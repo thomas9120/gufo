@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdint>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 
 #include "src/cli/serve/text_generation_backend.hpp"
@@ -12,16 +13,45 @@
 
 namespace gufo::server {
 
-// Process-wide `/metrics` values. Token counters advance per prefill chunk and
-// per generated token, so scrapes see work while requests are still running.
+// Process-wide `/metrics` values. Prompt tokens and measured prefill time
+// advance per prefill chunk; generated tokens advance per token, so scrapes see
+// work while requests are still running.
 namespace detail {
 inline std::atomic<std::uint64_t>& DeviceLostTotal() {
   static std::atomic<std::uint64_t> count{0};
   return count;
 }
-inline std::atomic<std::uint64_t>& TotalPromptTokens() {
-  static std::atomic<std::uint64_t> count{0};
-  return count;
+struct PromptMetrics {
+  std::uint64_t tokens{0};
+  double seconds{0.0};
+};
+
+/// Keeps prompt tokens and measured prefill time consistent for one scrape.
+/// Schedulers add one delta per prefill chunk, so rates are live and exclude
+/// idle time between chunks.
+class PromptMetricsCounter {
+public:
+  void Add(std::uint64_t tokens, double milliseconds) {
+    if (tokens == 0)
+      return;
+    std::lock_guard lock(mutex_);
+    totals_.tokens += tokens;
+    totals_.seconds += milliseconds / 1000.0;
+  }
+
+  [[nodiscard]] PromptMetrics Snapshot() const {
+    std::lock_guard lock(mutex_);
+    return totals_;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  PromptMetrics totals_;
+};
+
+inline PromptMetricsCounter& TotalPromptMetrics() {
+  static PromptMetricsCounter counter;
+  return counter;
 }
 inline std::atomic<std::uint64_t>& TotalGenTokens() {
   static std::atomic<std::uint64_t> count{0};
@@ -31,10 +61,6 @@ inline std::atomic<std::uint64_t>& TotalGenTokens() {
 inline std::atomic<std::uint64_t>& TotalCachedPromptTokens() {
   static std::atomic<std::uint64_t> count{0};
   return count;
-}
-inline std::atomic<double>& TotalPromptSeconds() {
-  static std::atomic<double> seconds{0.0};
-  return seconds;
 }
 inline std::atomic<double>& TotalGenSeconds() {
   static std::atomic<double> seconds{0.0};
@@ -104,7 +130,6 @@ inline void RecordRequestMetrics(const TextGenerationBackend::Result& result) {
   detail::TotalCachedPromptTokens().fetch_add(
       std::min(result.cached_prompt_tokens, result.prompt_tokens),
       std::memory_order_relaxed);
-  add_seconds(detail::TotalPromptSeconds(), result.prefill_ms);
   add_seconds(detail::TotalGenSeconds(), result.decode_ms);
   const std::uint64_t sequence_tokens =
       result.prompt_tokens + result.completion_tokens;
@@ -181,7 +206,11 @@ inline std::string GenerationLogDetails(
         << " cache_captured_capacity_bytes="
         << result.component_cache->captured_bytes
         << " cache_global_ledger_bytes="
-        << result.component_cache->ledger.total_bytes;
+        << result.component_cache->ledger.total_bytes
+        << " cache_global_ram_bytes="
+        << result.component_cache->ledger.ram_bytes
+        << " cache_copied_payload_bytes="
+        << result.component_cache->copied_payload_bytes;
   if (result.draft_tokens > 0)
     out << " acceptance_pct="
         << 100.0 * result.draft_accepted_tokens / result.draft_tokens;

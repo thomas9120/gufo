@@ -17,7 +17,6 @@
 #include "src/models/qwen/dflash_weights.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/kernels/dflash_kernels.hpp"
-#include "src/models/qwen/hip/kernels/verify_gemm_27b.hpp"
 #include "src/models/qwen/hip/mtp/detail/allocation.hpp"
 #include "src/models/qwen/hip/ops.hpp"
 
@@ -408,9 +407,6 @@ void QwenDFlashGpuExecutor::RunBlockGemm(const models::QwenTensorRef& weight,
     // matrix-core W8A8 route once the shared kernel read activations as float4
     // (11.3 vs 12.2 ms per draft block), so there is one route here.
     if (batch_size <= kDFlashMaxSharedBatch) {
-      if (TryLaunchVerifyGemm27(weight.type, weight.data, input, output,
-                                batch_size, output_size, input_size, stream_))
-        return;
       LaunchBatchedQuantGEMMFp32(weight.type, weight.data, input, output,
                                  batch_size, output_size, input_size, stream_);
       return;
@@ -475,9 +471,7 @@ void QwenDFlashGpuExecutor::RunInjectGemm(const models::QwenTensorRef& weight,
       LaunchExactBf16GEMMFp32SmallBatch(weight.data, chunk_input, chunk_output,
                                         chunk, output_size, input_size,
                                         stream_);
-    } else if (!TryLaunchVerifyGemm27(weight.type, weight.data, chunk_input,
-                                      chunk_output, chunk, output_size,
-                                      input_size, stream_)) {
+    } else {
       LaunchBatchedQuantGEMMFp32(weight.type, weight.data, chunk_input,
                                  chunk_output, chunk, output_size, input_size,
                                  stream_);
@@ -917,60 +911,12 @@ bool QwenDFlashGpuExecutor::InjectTargetContextChunk(
   return true;
 }
 
-kernels::DFlashSampling QwenDFlashGpuExecutor::PrepareDraftSampling(
-    const sampling::SamplerState* sampler, hipStream_t stream) {
-  kernels::DFlashSampling result;
-  if (sampler == nullptr)
-    return result;
-  const auto& config = sampler->config();
-  // The selector already restricts q to a small lattice. Filtering that
-  // lattice a second time lost useful coverage on short sampled completions.
-  result.repeat_penalty = config.repeat_penalty;
-  result.frequency_penalty = config.frequency_penalty;
-  result.presence_penalty = config.presence_penalty;
-  result.repeat_last_n =
-      std::min<std::size_t>(config.repeat_last_n, max_context_);
-  const auto penalties =
-      config.frequency_penalty != 0.0F || config.presence_penalty != 0.0F
-          ? sampler->penalties()
-          : std::span<const sampling::TokenPenalty>{};
-  const auto history = config.repeat_penalty != 1.0F
-                           ? sampler->history()
-                           : std::span<const tokenization::TokenId>{};
-  const auto bytes = penalties.size_bytes() + history.size_bytes();
-  const auto capacity = std::size_t{injection_capacity_} *
-                        GetTargetFeaturesSize() * sizeof(float);
-  // Context projection has finished; reuse its input scratch for this proposal.
-  // An unusually large policy can always retain the original valid q.
-  if (bytes > capacity)
-    return {};
-  if (!penalties.empty()) {
-    HIP_CHECK(hipMemcpyAsync(d_target_features_, penalties.data(),
-                             penalties.size_bytes(), hipMemcpyHostToDevice,
-                             stream));
-    result.penalties =
-        reinterpret_cast<const sampling::TokenPenalty*>(d_target_features_);
-    result.penalty_count = penalties.size();
-  }
-  if (!history.empty()) {
-    auto* destination = reinterpret_cast<std::byte*>(d_target_features_) +
-                        penalties.size_bytes();
-    HIP_CHECK(hipMemcpyAsync(destination, history.data(), history.size_bytes(),
-                             hipMemcpyHostToDevice, stream));
-    result.history =
-        reinterpret_cast<const tokenization::TokenId*>(destination);
-    result.history_count = history.size();
-  }
-  return result;
-}
-
 std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     tokenization::TokenId anchor_token, std::uint32_t current_pos,
     std::uint32_t draft_count, float temperature,
     std::span<const float> sample_uniforms, std::vector<float>* out_confidences,
     std::vector<tokenization::TokenId>* out_candidate_ids,
-    std::vector<float>* out_candidate_probabilities, const DFlashTrace& trace,
-    const sampling::SamplerState* sampler) {
+    std::vector<float>* out_candidate_probabilities, const DFlashTrace& trace) {
   CheckContinuation();
   const auto& weights = model_->GetWeights();
   const auto& cfg = model_->GetConfig();
@@ -1164,16 +1110,8 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
   }
   // The FFN is finished. Its buffers hold all independent top-k partials;
   // one selector launch then walks this request's predecessor chain.
-  struct SamplingUploadCompletion {
-    hipStream_t stream;
-    bool pending;
-    ~SamplingUploadCompletion() {
-      if (pending)
-        (void)hipStreamSynchronize(stream);
-    }
-  } sampling_upload{stream_, sampler != nullptr};
-  const std::array sequences{kernels::DFlashSelectorSequence{
-      draft_count, temperature, PrepareDraftSampling(sampler, stream_)}};
+  const std::array sequences{
+      kernels::DFlashSelectorSequence{draft_count, temperature}};
   kernels::LaunchDFlashSelectorBatch(
       d_logits_, d_selector_hidden_, weights.selector_predecessor.data,
       weights.selector_successor.data, d_out_token_, d_confidences_,
@@ -1230,7 +1168,6 @@ std::vector<tokenization::TokenId> QwenDFlashGpuExecutor::ForwardBlock(
     throw std::runtime_error("DFlash GPU block synchronization failed");
   }
 
-  sampling_upload.pending = false;
   return tokens;
 }
 

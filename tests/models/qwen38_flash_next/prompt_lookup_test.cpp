@@ -1,11 +1,12 @@
-#include "src/core/speculative/prompt_lookup.hpp"
+#include "src/models/qwen38_flash_next/prompt_lookup.hpp"
 
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <vector>
 
-using Lookup = gufo::speculative::PromptLookup<>;
+namespace qfn = gufo::models::qwen38_flash_next;
+using Lookup = qfn::PromptLookup;
 
 void Require(bool condition, const char* message) {
   if (!condition)
@@ -66,45 +67,6 @@ void CheckLongestWins() {
   const auto match = lookup.Find(committed, tail);
   Require(match.length >= 12 && committed[match.start] == 7,
           "the longest-matching occurrence was not chosen");
-}
-
-// The nearest repeated passage ends at a message boundary. Rejecting that
-// source must find an earlier complete continuation, without changing the
-// default lookup policy used by Flash-Next.
-void CheckFilteredContinuation() {
-  const auto passage = Range(1000, 40);
-  auto committed = passage;
-  committed.insert(committed.end(), passage.begin(), passage.begin() + 24);
-  committed.insert(committed.end(), {9000, 9001, 9002});
-  committed.insert(committed.end(), passage.begin(), passage.begin() + 23);
-  Lookup lookup;
-  lookup.Extend(committed);
-  const std::vector<std::int32_t> tail{1023};
-  const auto nearest = lookup.Find(committed, tail, 24);
-  Require(nearest.start == 64 && committed[nearest.start] == 9000,
-          "unfiltered lookup no longer chooses the nearest equal match");
-  const auto valid_source = [&](std::size_t start) {
-    const auto count = std::min(std::size_t{7}, committed.size() - start);
-    return std::ranges::find(std::span(committed).subspan(start, count),
-                             9000) ==
-           std::span(committed).subspan(start, count).end();
-  };
-  const auto filtered = lookup.Find(committed, tail, 24, valid_source);
-  Require(filtered.start == 24 && filtered.length == 24 &&
-              committed[filtered.start] == 1024,
-          "rejected boundary did not select an earlier valid continuation");
-  Require(lookup.Find(committed, tail, 24, [](std::size_t) { return false; })
-                  .length == 0,
-          "lookup ignored a source rejection");
-  Require(lookup.Find(committed, tail, 24, valid_source, true).length == 0,
-          "filtering bypassed the required accepted copy");
-  lookup.Observe(23, 1, 1);
-  const auto resumed = lookup.Find(committed, tail, 24, valid_source, true);
-  Require(resumed.start == 24 && resumed.length == 24,
-          "a valid filtered continuation did not resume");
-  lookup.Observe(63, 1, 1);
-  Require(lookup.Find(committed, tail, 24, valid_source, true).length == 0,
-          "filtering resumed a different source outside the resume window");
 }
 
 // Incremental indexing equals indexing everything at once; a shorter
@@ -202,9 +164,6 @@ void CheckResume() {
   const auto match = lookup.Find(committed, tail);
   Require(match.length == 5 && match.start == 27,
           "a resumed copy was not matched");
-  Require(
-      lookup.Find(committed, tail, Lookup::kSampledMinMatch, true).length == 0,
-      "a short resumed match bypassed the sampled neural proposal");
   // A resumed copy that keeps half its tokens still resumes; one that keeps
   // fewer has left the text, until a full match copies again.
   lookup.Observe(match.start, 8, 4);
@@ -244,40 +203,6 @@ void CheckResume() {
   lookup.Extend(committed);
   Require(lookup.Find(committed, tail).length == 0,
           "Clear() kept the last copy");
-}
-
-void CheckEstablishedSampledCopy() {
-  auto committed = Range(1000, 64);
-  const auto noise = Range(5000, 7);
-  committed.insert(committed.end(), noise.begin(), noise.end());
-  const auto copied = Range(1010, 25);
-  committed.insert(committed.end(), copied.begin(), copied.end());
-  const std::vector<std::int32_t> tail{1035};
-  Lookup lookup;
-  lookup.Extend(committed);
-  const auto find = [&](const Lookup& index) {
-    return index.Find(committed, tail, Lookup::kSampledMinMatch, true);
-  };
-  Require(find(lookup).length == 0,
-          "a new sampled match bypassed the neural proposal");
-  lookup.Observe(30, 7, 3);
-  Require(find(lookup).length == 0,
-          "a mostly rejected sampled copy bypassed the neural proposal");
-  lookup.Observe(30, 7, 7);
-  const auto match = find(lookup);
-  Require(match.start == 36 && match.length == 26,
-          "an established full sampled match did not continue");
-  Lookup restored;
-  restored.Restore(lookup.Save());
-  restored.Extend(committed);
-  Require(find(restored).start == match.start,
-          "an established sampled copy did not survive restoration");
-  restored.BeginRequest();
-  Require(find(restored).length == 0,
-          "a new request inherited an established sampled copy");
-  lookup.Observe(600, 7, 7);
-  Require(find(lookup).length == 0,
-          "an unrelated accepted source enabled the sampled bypass");
 }
 
 // A request's first decode step copies nothing; the flag survives a
@@ -401,12 +326,10 @@ int main() {
   try {
     CheckCopy();
     CheckLongestWins();
-    CheckFilteredContinuation();
     CheckIncremental();
     CheckRewrite();
     CheckProposalInsideCommitted();
     CheckResume();
-    CheckEstablishedSampledCopy();
     CheckFirstStep();
     CheckRequestBoundary();
     CheckSampledSources();

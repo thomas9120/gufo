@@ -43,11 +43,9 @@ void LaunchWideFfn(const void* w, const float* x, float* y, std::size_t batch,
     grouped.template operator()<16>();
 }
 
-// A nonzero valid_rows runs one sixteen-row group masked to its first
-// valid_rows tokens.
 template<core::GgmlType Type, std::size_t Batch, std::size_t Groups = 1>
 void Launch(const void* w, const float* x, float* y, std::size_t m,
-            std::size_t k, hipStream_t stream, std::size_t valid_rows = 0) {
+            std::size_t k, hipStream_t stream) {
   const auto launch =
       [&]<std::uint32_t Waves, std::size_t Rows, std::size_t Tiles,
           std::uint32_t MinWaves, std::size_t Step = Batch, bool Narrow = true,
@@ -57,23 +55,12 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
           static_assert(Waves == 8 && Rows == 6 && Tiles == 1 &&
                         MinWaves == 4 && Step == 1 && Narrow &&
                         LogicalLanes == 32);
-          LaunchKQuantSixteenWave64(Type, w, x, y, m, k, stream, Groups,
-                                    valid_rows);
+          LaunchKQuantSixteenWave64(Type, w, x, y, m, k, stream, Groups);
         } else {
           constexpr std::size_t kRowsPerBlock =
               Waves * Rows * (32 / LogicalLanes);
           const dim3 grid(static_cast<unsigned>(
               ((m + kRowsPerBlock - 1) / kRowsPerBlock) * Groups));
-          if constexpr (Batch == 16 && Groups == 1) {
-            if (valid_rows != 0) {
-              SmallBatchKQuantExactFp32GEMMKernel<
-                  Waves, Batch, Rows, Type, Tiles, MinWaves, Groups, Narrow,
-                  Step, 64, LogicalLanes,
-                  kKQuantDistributedOutput<Batch, Type, 64>, false, true>
-                  <<<grid, Waves * 32, 0, stream>>>(w, x, y, m, k, valid_rows);
-              return;
-            }
-          }
           SmallBatchKQuantExactFp32GEMMKernel<Waves, Batch, Rows, Type, Tiles,
                                               MinWaves, Groups, Narrow, Step,
                                               64, LogicalLanes>
@@ -81,16 +68,6 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
         }
       };
   const bool down = m == 5120 && k == 17408;
-  if constexpr (Type == core::GgmlType::kIQ4_XS && Batch == 5) {
-    // Keep the scalar partials and use the eight-column reduction for five
-    // live tokens. Empty columns stay zero and never write output.
-    constexpr std::size_t kRowsPerBlock = 16 * 4 * 2;
-    SmallBatchKQuantExactFp32GEMMKernel<16, 5, 4, Type, 1, 4, Groups, true, 1,
-                                        64, 16, true>
-        <<<((m + kRowsPerBlock - 1) / kRowsPerBlock) * Groups, 512, 0,
-           stream>>>(w, x, y, m, k);
-    return;
-  }
   if constexpr (Batch > 8) {
     if constexpr (Batch == 14 && Type != core::GgmlType::kQ6_K) {
       if (m == 17408 && k == 5120) {
@@ -209,7 +186,7 @@ void Launch(const void* w, const float* x, float* y, std::size_t m,
 template<core::GgmlType Type>
 void LaunchBatch(const void* w, const float* x, float* y, std::size_t batch,
                  std::size_t m, std::size_t k, hipStream_t stream,
-                 std::size_t groups, std::size_t valid_rows = 0) {
+                 std::size_t groups) {
   // Adjacent workgroups reuse the same weight rows. Fourteen-row groups cover
   // paired seven-row verification blocks without a separate tail.
   if (groups > 1) {
@@ -253,7 +230,11 @@ void LaunchBatch(const void* w, const float* x, float* y, std::size_t batch,
       }
       return;
     case 5:
-      Launch<Type, 5>(w, x, y, m, k, stream);
+      if constexpr (Type == core::GgmlType::kQ4_K ||
+                    Type == core::GgmlType::kQ5_K ||
+                    Type == core::GgmlType::kQ6_K) {
+        Launch<Type, 5>(w, x, y, m, k, stream);
+      }
       return;
     case 6:
       if constexpr (Type != core::GgmlType::kQ6_K) {
@@ -288,7 +269,7 @@ void LaunchBatch(const void* w, const float* x, float* y, std::size_t batch,
       Launch<Type, 15>(w, x, y, m, k, stream);
       return;
     case 16:
-      Launch<Type, 16>(w, x, y, m, k, stream, valid_rows);
+      Launch<Type, 16>(w, x, y, m, k, stream);
       return;
     default:
       return;
@@ -483,17 +464,11 @@ bool TryLaunchKQuantSmallBatchWave64(core::GgmlType type, const void* w,
                                      const float* x, float* y,
                                      std::size_t batch, std::size_t m,
                                      std::size_t k, hipStream_t stream,
-                                     std::size_t groups,
-                                     std::size_t valid_rows) {
-  // A masked sixteen-row group replaces a split of nine to fifteen rows.
-  if (valid_rows != 0 &&
-      (batch != 16 || groups != 1 || valid_rows < 9 || valid_rows > 15))
-    return false;
+                                     std::size_t groups) {
   // These FFNs otherwise split concurrent verification into scalar-sized
   // batches. Keep each token's original FP32 partials in wider native groups.
-  // LaunchWideFfn does not mask; masked Q3_K and IQ4_NL groups return false.
   if (m == 17408 && k == 5120 && (batch == 14 || batch == 16) && groups >= 1 &&
-      groups <= 4 && valid_rows == 0) {
+      groups <= 4) {
     if (type == core::GgmlType::kQ3_K) {
       LaunchWideFfn<core::GgmlType::kQ3_K>(w, x, y, batch, groups, stream);
       return true;
@@ -541,20 +516,20 @@ bool TryLaunchKQuantSmallBatchWave64(core::GgmlType type, const void* w,
     }
     switch (type) {
       case core::GgmlType::kQ4_K:
-        LaunchBatch<core::GgmlType::kQ4_K>(w, x, y, batch, m, k, stream, groups,
-                                           valid_rows);
+        LaunchBatch<core::GgmlType::kQ4_K>(w, x, y, batch, m, k, stream,
+                                           groups);
         return true;
       case core::GgmlType::kQ5_K:
-        LaunchBatch<core::GgmlType::kQ5_K>(w, x, y, batch, m, k, stream, groups,
-                                           valid_rows);
+        LaunchBatch<core::GgmlType::kQ5_K>(w, x, y, batch, m, k, stream,
+                                           groups);
         return true;
       case core::GgmlType::kIQ4_XS:
         LaunchBatch<core::GgmlType::kIQ4_XS>(w, x, y, batch, m, k, stream,
-                                             groups, valid_rows);
+                                             groups);
         return true;
       case core::GgmlType::kQ6_K:
-        LaunchBatch<core::GgmlType::kQ6_K>(w, x, y, batch, m, k, stream, groups,
-                                           valid_rows);
+        LaunchBatch<core::GgmlType::kQ6_K>(w, x, y, batch, m, k, stream,
+                                           groups);
         return true;
       default:
         return false;
@@ -577,7 +552,7 @@ bool TryLaunchKQuantSmallBatchWave64(core::GgmlType type, const void* w,
       LaunchBatch<core::GgmlType::kQ5_K>(w, x, y, batch, m, k, stream, groups);
       return true;
     case core::GgmlType::kIQ4_XS:
-      if (!((batch == 4 && down) || (batch >= 5 && (up || down)))) {
+      if (!((batch == 4 && down) || (batch >= 6 && (up || down)))) {
         return false;
       }
       LaunchBatch<core::GgmlType::kIQ4_XS>(w, x, y, batch, m, k, stream,

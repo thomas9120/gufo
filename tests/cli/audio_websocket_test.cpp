@@ -16,10 +16,11 @@
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/websocket.hpp"
 #include "src/core/json.hpp"
-#include "src/core/platform/net.hpp"
+// WINDOWS: exercise WebSocket transport on Winsock.
+#include "src/core/platform/socket.hpp"
 
 namespace {
-namespace net = gufo::net;
+// WINDOWS: keep native Winsock handles; gufo::platform wrappers replace net::.
 using namespace gufo::server;
 namespace json = gufo::json;
 
@@ -29,8 +30,10 @@ public:
          std::string_view key = "dGhlIHNhbXBsZSBub25jZQ==",
          std::string_view authorization = "Bearer test") {
     fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    assert(fd >= 0);
-    assert(net::SetSocketTimeouts(fd, 3'000));
+    // WINDOWS: exercise WebSocket transport on Winsock.
+    assert(fd != gufo::platform::kInvalidSocket);
+    assert(gufo::platform::SetSocketTimeout(fd, SO_RCVTIMEO,
+                                            std::chrono::seconds(3)) == 0);
     sockaddr_in address{.sin_family = AF_INET, .sin_port = htons(port)};
     assert(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
     assert(::connect(fd, reinterpret_cast<sockaddr*>(&address),
@@ -49,12 +52,14 @@ public:
   }
   ~Client() {
     ::shutdown(fd, SHUT_RDWR);
-    net::CloseSocket(fd);
+    // WINDOWS: exercise WebSocket transport on Winsock.
+    gufo::platform::CloseSocket(fd);
   }
   void Send(std::string_view bytes) {
     while (!bytes.empty()) {
-      const auto count = static_cast<ssize_t>(
-          net::SendNoSignal(fd, bytes.data(), bytes.size()));
+      // WINDOWS: exercise WebSocket transport on Winsock.
+      const auto count = gufo::platform::SocketSend(fd, bytes.data(),
+                                                    bytes.size(), MSG_NOSIGNAL);
       assert(count > 0);
       bytes.remove_prefix(static_cast<std::size_t>(count));
     }
@@ -104,13 +109,15 @@ public:
     assert(event.member_str("type") == type);
     return event;
   }
-  int fd;
+  // WINDOWS: exercise WebSocket transport on Winsock.
+  gufo::platform::SocketHandle fd;
   std::string headers;
 
 private:
   void Read(char* bytes, std::size_t size) {
     while (size) {
-      const auto count = ::recv(fd, bytes, size, 0);
+      // WINDOWS: exercise WebSocket transport on Winsock.
+      const auto count = gufo::platform::SocketRecv(fd, bytes, size, 0);
       assert(count > 0);
       bytes += count;
       size -= static_cast<std::size_t>(count);
@@ -121,10 +128,35 @@ private:
 // The server's receive timeout is an idle limit. A client that only listens
 // to streamed output must stay connected; a silent session closes cleanly.
 void ListeningClientIsNotIdle() {
+// WINDOWS: exercise WebSocket transport on Winsock.
+#ifdef _WIN32
+  // Winsock has no POSIX socketpair; exercise the same byte stream over TCP.
+  const auto listener = ::socket(AF_INET, SOCK_STREAM, 0);
+  assert(listener != gufo::platform::kInvalidSocket);
+  sockaddr_in address{.sin_family = AF_INET};
+  assert(::inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1);
+  assert(::bind(listener, reinterpret_cast<sockaddr*>(&address),
+                sizeof(address)) == 0);
+  assert(::listen(listener, 1) == 0);
+  socklen_t length = sizeof(address);
+  assert(::getsockname(listener, reinterpret_cast<sockaddr*>(&address),
+                       &length) == 0);
+  std::array<gufo::platform::SocketHandle, 2> fds{};
+  fds[1] = ::socket(AF_INET, SOCK_STREAM, 0);
+  assert(fds[1] != gufo::platform::kInvalidSocket);
+  assert(::connect(fds[1], reinterpret_cast<sockaddr*>(&address),
+                   sizeof(address)) == 0);
+  fds[0] = ::accept(listener, nullptr, nullptr);
+  assert(fds[0] != gufo::platform::kInvalidSocket);
+  gufo::platform::CloseSocket(listener);
+#else
   std::array<int, 2> fds{};
   assert(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds.data()) == 0);
-  assert(net::SetSocketTimeouts(fds[0], 300));
-  assert(net::SetSocketTimeouts(fds[1], 3'000));
+#endif  // WINDOWS: platform coverage.
+  assert(gufo::platform::SetSocketTimeout(fds[0], SO_RCVTIMEO,
+                                          std::chrono::milliseconds(300)) == 0);
+  assert(gufo::platform::SetSocketTimeout(fds[1], SO_RCVTIMEO,
+                                          std::chrono::seconds(3)) == 0);
   {
     WebSocket socket(fds[0], {});
     // Unmasked final binary frame with a five-byte payload.
@@ -134,20 +166,25 @@ void ListeningClientIsNotIdle() {
     while (std::chrono::steady_clock::now() < streaming_until) {
       assert(socket.SendBinary("audio"));
       std::string frame(expected.size(), '\0');
-      assert(::recv(fds[1], frame.data(), frame.size(), MSG_WAITALL) ==
+      // WINDOWS: exercise WebSocket transport on Winsock.
+      assert(gufo::platform::SocketRecv(fds[1], frame.data(), frame.size(),
+                                        MSG_WAITALL) ==
              static_cast<ssize_t>(frame.size()));
       assert(frame == expected);
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     assert(!socket.cancelled());
     std::array<char, 4> close{};
-    assert(::recv(fds[1], close.data(), close.size(), MSG_WAITALL) == 4);
+    // WINDOWS: exercise WebSocket transport on Winsock.
+    assert(gufo::platform::SocketRecv(fds[1], close.data(), close.size(),
+                                      MSG_WAITALL) == 4);
     assert(std::string_view(close.data(), close.size()) ==
            std::string_view("\x88\x02\x03\xE9", 4));
     assert(socket.cancelled());
   }
-  net::CloseSocket(fds[0]);
-  net::CloseSocket(fds[1]);
+  // WINDOWS: exercise WebSocket transport on Winsock.
+  gufo::platform::CloseSocket(fds[0]);
+  gufo::platform::CloseSocket(fds[1]);
 }
 }  // namespace
 
@@ -267,6 +304,9 @@ int main() {
     client.Event("session.done");
     assert(tts_calls == 2);
     client.Send(Client::Frame("unmasked", 1, true, false));
+    // WINDOWS: An unread payload must not reset away the protocol-error close
+    // reply before a slow peer has a chance to consume it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
     auto [opcode, close] = client.Receive();
     assert(opcode == 8 && close == std::string("\x03\xEA", 2));
   }
@@ -295,6 +335,40 @@ int main() {
     client.Send(Client::Frame(std::string("\x03\xE8", 2), 8));
     const auto reply = client.Receive();
     assert(reply.first == 8 && reply.second == std::string("\x03\xE8", 2));
+  }
+  // WINDOWS: A local stop must wake readers even when no WebSocket frame
+  // arrives.
+  {
+    HttpServer idle_server("127.0.0.1", 0, nullptr, nullptr, tts, asr,
+                           {.api_key = "test"});
+    assert(idle_server.start(&error));
+    std::jthread idle_worker([&] { idle_server.run(); });
+    Client idle(idle_server.port(), "/v1/audio/speech/stream");
+    // Leave a masked frame incomplete as well as the application session.
+    idle.Send(std::string("\x81\x85", 2));
+    const auto start = std::chrono::steady_clock::now();
+    idle_server.stop();
+    idle_worker.join();
+    assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
+  }
+  // Stop also cancels active work while the reader is waiting for more input.
+  {
+    entered = false;
+    cancelled = false;
+    Client active(server.port(), "/v1/audio/speech/stream");
+    active.Text(
+        R"({"type":"session.config","voice":"vivian","response_format":"pcm","stream_audio":true})");
+    active.Text(R"({"type":"input.text","text":"wait"})");
+    active.Text(R"({"type":"input.done"})");
+    active.Event("audio.start");
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!entered && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::yield();
+    assert(entered);
+    server.stop();
+    assert(cancelled);
+    assert(std::chrono::steady_clock::now() < deadline);
   }
   server.stop();
   worker.join();

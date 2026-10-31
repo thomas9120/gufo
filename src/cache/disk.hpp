@@ -200,7 +200,10 @@ enum class DiskPublicationStep {
   kIndexed,
 };
 #endif
-// Linux directory ownership; no payload reads or reclamation at startup.
+// Exclusive directory ownership; no payload reads or reclamation at startup.
+// Windows requires private local NTFS directories. Files and managed
+// directories are flushed, but ancestor namespace durability across power
+// loss is not guaranteed; missing/corrupt checkpoints are recomputed.
 // Mutating operations serialize through one I/O lock (including writers),
 // protecting their dependencies from eviction. Pin/Open/Stats use short locks
 // without waiting for I/O, streams or optional-write yielding.

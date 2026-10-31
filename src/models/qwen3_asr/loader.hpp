@@ -8,7 +8,6 @@
 #include <string_view>
 #include <vector>
 
-#include "src/core/gguf_reader.hpp"
 #include "src/models/qwen3_asr/config.hpp"
 #include "src/models/qwen3_asr/tensor.hpp"
 
@@ -18,7 +17,6 @@ struct MappedRegion {
   const std::byte* data{nullptr};
   std::size_t size{0};
   std::size_t payload_offset{0};
-  platform::PlatformFile file_descriptor{platform::kInvalidFile};
 };
 
 struct LoadResult {
@@ -33,11 +31,6 @@ struct LoadResult {
   /// the original payload alignment for GPU upload.
   [[nodiscard]] std::vector<MappedRegion> RegionsFor(
       std::initializer_list<std::string_view> prefixes) const;
-
-  /// Drops the resident pages of every mapped shard once the caller's weights
-  /// live in device memory. Pointers in `store` stay valid (pages refault).
-  void ReleaseHostPages() const noexcept;
-  [[nodiscard]] std::vector<core::GgufMappedRegion> WeightUploadRegions() const;
 };
 
 [[nodiscard]] LoadResult LoadModelDirectory(const std::string& model_dir);

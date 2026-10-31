@@ -217,7 +217,7 @@ void ScoreOfficialReference(
 
 void DumpReferenceFrontiers(
     const std::shared_ptr<models::deepseek_v4_flash::Model>& model,
-    const std::string& output_directory, bool prefill_only, bool narrow) {
+    const std::string& output_directory, bool prefill_only) {
   namespace fs = std::filesystem;
   using models::deepseek_v4_flash::ChatMessage;
   using models::deepseek_v4_flash::RenderChat;
@@ -254,9 +254,7 @@ void DumpReferenceFrontiers(
   json::Value report = json::Value::object();
   report["vocab"] = model->VocabSize();
   report["dtype"] = "float32-le";
-  report["prefill_policy"] =
-      narrow ? "explicit 32-token calls" : "explicit 2048/4096-token calls";
-  report["narrow"] = narrow;
+  report["prefill_policy"] = "explicit 2048/4096-token calls";
   report["context_capacity"] = 20480;
   report["prefix"] =
       "repeated x words inside the native no-thinking chat template";
@@ -264,15 +262,7 @@ void DumpReferenceFrontiers(
   report["decode_tokens"] = decode_tokens;
   report["points"] = json::Value::array();
   std::ofstream manifest(directory / "manifest.tsv");
-  // Narrow MMQ tiles were invisible to the original 2K/4K call grid. Keep
-  // the two known regression points available without a full model sweep.
-  const std::vector<std::size_t> depths =
-      narrow ? std::vector<std::size_t>{4096, 12288}
-             : std::vector<std::size_t>{0, 4096, 8192, 12288, 16384};
-  const std::vector<std::size_t> prefill_steps =
-      narrow ? std::vector<std::size_t>{32}
-             : std::vector<std::size_t>{2048, 4096};
-  for (const std::size_t depth : depths) {
+  for (const std::size_t depth : {0u, 4096u, 8192u, 12288u, 16384u}) {
     const std::size_t prefix = depth == 0 ? 16 : depth;
     Require(prefix > overhead, "frontier prefix is shorter than chat framing");
     std::string body = "x";
@@ -292,7 +282,7 @@ void DumpReferenceFrontiers(
     prompt_file << RenderChat(chat);
     Require(prompt_file.good(), "cannot write frontier prompt");
     prompt_file.close();
-    for (const std::size_t prefill_step : prefill_steps) {
+    for (const std::size_t prefill_step : {2048u, 4096u}) {
       std::string error;
       auto session = model->CreateSession(
           model->HasDspark() ? gufo::core::SessionMode::kSpeculative

@@ -80,8 +80,6 @@ bool QwenMtpGpuDraftBackend::PrimeTargetContext(
           context.prompt_tokens[index + 1], hidden,
           static_cast<std::uint32_t>(index), false);
     }
-    // The prompt rows may be pinned and reused by the next target prefill.
-    executor_->Synchronize();
     const std::size_t final_offset =
         (context.prompt_tokens.size() - 1) * context.hidden_size;
     const auto final_hidden =
@@ -91,11 +89,6 @@ bool QwenMtpGpuDraftBackend::PrimeTargetContext(
     return true;
   } catch (const std::exception& exception) {
     last_error_ = exception.what();
-    // Earlier per-row uploads may still be reading the pinned prompt rows.
-    try {
-      executor_->Synchronize();
-    } catch (...) {
-    }
     Reset();
     return false;
   }

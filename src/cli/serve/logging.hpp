@@ -39,7 +39,7 @@ public:
   [[nodiscard]] static LogLevel Level();
 
   /// False when `Log(level)` would discard the line. Expensive lines should
-  /// check this before formatting: `MemoryStatus()` reads /proc twice.
+  /// check this before formatting: `MemoryStatus()` queries host memory.
   [[nodiscard]] static bool Enabled(LogLevel level);
 
   /// Logs a general server or engine message:

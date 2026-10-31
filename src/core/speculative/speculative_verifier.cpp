@@ -403,7 +403,6 @@ struct SpeculativeVerifier::PreparedStep {
   std::vector<double> token_probabilities;
   std::optional<sampling::SamplerState> working_sampler;
   std::optional<StepResult> immediate;
-  std::vector<sampling::TokenLogprobs> logprobs;
   std::uint32_t position{0};
   tokenization::TokenId eos_id{0};
   bool sampled{false};
@@ -427,8 +426,7 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifyStep(
   if (!use_batched_verification_ &&
       sampler.config().can_use_unmodified_argmax()) {
     return VerifySequentialStep(current_sequence, cur_pos, current_token,
-                                eos_id, max_emitted_tokens,
-                                sampler.config().logprobs);
+                                eos_id, max_emitted_tokens);
   }
   auto prepared = PrepareStep({*this, current_sequence, cur_pos, current_token,
                                eos_id, max_emitted_tokens, sampler});
@@ -476,12 +474,14 @@ SpeculativeVerifier::PreparedStep SpeculativeVerifier::PrepareStep(
     return prepared;
   auto& working_sampler =
       prepared.sampled ? *prepared.working_sampler : request.sampler;
-  prepared.proposal = draft_backend_->ProposeForRequest(
-      {draft_backend_, request.sequence, request.position,
-       prepared.max_draft_tokens,
-       prepared.random_sampling ? request.sampler.config().temperature : 0.0F,
-       prepared.random_sampling ? working_sampler.mutable_rng_state() : nullptr,
-       &working_sampler});
+  prepared.proposal =
+      prepared.random_sampling
+          ? draft_backend_->ProposeSampled(request.sequence, request.position,
+                                           prepared.max_draft_tokens,
+                                           request.sampler.config().temperature,
+                                           working_sampler.mutable_rng_state())
+          : draft_backend_->Propose(request.sequence, request.position,
+                                    prepared.max_draft_tokens);
   PrepareProposalVerification(prepared, request, defer_target_only);
   return prepared;
 }
@@ -497,8 +497,7 @@ void SpeculativeVerifier::PrepareTargetOnlyStep(PreparedStep& prepared,
     prepared.capture_hidden = draft_backend_ != nullptr &&
                               draft_backend_->RequiresTargetHiddenStates();
     prepared.capture_logits =
-        (prepared.sampled || options_.retain_frontier_logits ||
-         request.sampler.config().logprobs) &&
+        (prepared.sampled || options_.retain_frontier_logits) &&
         !target_executor_->SupportsDeviceResidentSampling();
     return;
   }
@@ -519,10 +518,6 @@ void SpeculativeVerifier::PrepareTargetOnlyStep(PreparedStep& prepared,
       .next_token_logits = std::move(logits),
       .hit_eos = IsStopToken(next, request.eos_id),
   };
-  if (request.sampler.config().logprobs)
-    prepared.immediate->logprobs.push_back(
-        *sampling::CollectLogprobs(target_executor_->CopyLastLogits(), next,
-                                   request.sampler.config().logprobs));
 }
 
 void SpeculativeVerifier::PrepareProposalVerification(
@@ -602,8 +597,7 @@ void SpeculativeVerifier::PrepareProposalVerification(
                          proposal.tokens.end());
   prepared.capture_hidden = draft_backend_->RequiresTargetHiddenStates();
   prepared.capture_logits =
-      (prepared.sampled || request.sampler.config().logprobs) &&
-      !target_executor_->SupportsDeviceResidentSampling();
+      prepared.sampled && !target_executor_->SupportsDeviceResidentSampling();
   target_executor_->SaveState(request.position);
 }
 
@@ -692,17 +686,10 @@ SpeculativeVerifier::ProcessVerificationChunk(
     sampler.SetRngState(working_sampler.rng_state());
     ++stats_.total_verification_steps;
     ++stats_.total_emitted_tokens;
-    StepResult result{.emitted_tokens = {next},
+    return StepResult{.emitted_tokens = {next},
                       .next_token = next,
                       .next_token_logits = std::move(logits),
                       .hit_eos = IsStopToken(next, eos_id)};
-    if (sampler.config().logprobs)
-      result.logprobs.push_back(*sampling::CollectLogprobs(
-          prepared.capture_logits ? std::span<const float>(verification.logits)
-                                        .first(verification.vocab_size)
-                                  : target_executor_->CopyVerificationLogits(0),
-          next, sampler.config().logprobs));
-    return result;
   }
   auto& accepted_count = prepared.accepted_count;
   tokenization::TokenId correction_token = 0;
@@ -779,18 +766,6 @@ SpeculativeVerifier::ProcessVerificationChunk(
           verification.hidden_width));
     }
   }
-  if (sampler.config().logprobs) {
-    for (auto index = chunk_begin; index < accepted_count; ++index) {
-      const auto row =
-          prepared.capture_logits
-              ? std::span<const float>(verification.logits)
-                    .subspan((index - chunk_begin) * verification.vocab_size,
-                             verification.vocab_size)
-              : target_executor_->CopyVerificationLogits(index - chunk_begin);
-      prepared.logprobs.push_back(*sampling::CollectLogprobs(
-          row, proposal.tokens[index], sampler.config().logprobs));
-    }
-  }
   prepared.verified_rows = chunk_end;
   if (!complete)
     return std::nullopt;
@@ -804,16 +779,6 @@ SpeculativeVerifier::ProcessVerificationChunk(
     }
   }
 
-  if (sampler.config().logprobs) {
-    const auto row =
-        prepared.capture_logits
-            ? std::span<const float>(verification.logits)
-                  .subspan(correction_row_index * verification.vocab_size,
-                           verification.vocab_size)
-            : target_executor_->CopyVerificationLogits(correction_row_index);
-    prepared.logprobs.push_back(*sampling::CollectLogprobs(
-        row, correction_token, sampler.config().logprobs));
-  }
   std::vector<float> frontier;
   if (options_.retain_frontier_logits) {
     const auto row =
@@ -834,11 +799,8 @@ SpeculativeVerifier::ProcessVerificationChunk(
   }
 
   StepResult result;
-  result.logprobs = std::move(prepared.logprobs);
   result.draft_count = num_draft;
   result.accepted_count = accepted_count;
-  result.lookup_tokens = proposal.from_lookup ? num_draft : 0;
-  result.lookup_accepted_tokens = proposal.from_lookup ? accepted_count : 0;
   result.emitted_tokens.insert(
       result.emitted_tokens.end(), proposal.tokens.begin(),
       proposal.tokens.begin() + static_cast<std::ptrdiff_t>(accepted_count));
@@ -898,8 +860,7 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
       request.sampler.config().Validate();
       result[index] = verifier.VerifySequentialStep(
           request.sequence, request.position, request.current_token,
-          request.eos_id, request.max_emitted_tokens,
-          request.sampler.config().logprobs);
+          request.eos_id, request.max_emitted_tokens);
       continue;
     }
     auto& step =
@@ -912,8 +873,7 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
           {verifier.draft_backend_, request.sequence, request.position,
            step.max_draft_tokens,
            step.random_sampling ? request.sampler.config().temperature : 0.0F,
-           step.random_sampling ? sampler.mutable_rng_state() : nullptr,
-           &sampler});
+           step.random_sampling ? sampler.mutable_rng_state() : nullptr});
     }
   }
   if (!draft_requests.empty()) {
@@ -990,8 +950,7 @@ std::vector<SpeculativeVerifier::StepResult> SpeculativeVerifier::VerifyBatch(
 SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
     std::span<const tokenization::TokenId> current_sequence,
     std::uint32_t cur_pos, tokenization::TokenId current_token,
-    tokenization::TokenId eos_id, std::uint32_t max_emitted_tokens,
-    std::optional<std::uint32_t> logprobs) {
+    tokenization::TokenId eos_id, std::uint32_t max_emitted_tokens) {
   if (max_emitted_tokens == 0) {
     throw std::invalid_argument(
         "speculative verification must emit at least one token");
@@ -1010,16 +969,12 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
     ++stats_.total_verification_steps;
     ++stats_.total_emitted_tokens;
     const bool hit_eos = IsStopToken(next, eos_id);
-    StepResult result{.emitted_tokens = {next},
-                      .accepted_count = 0,
-                      .draft_count = 0,
-                      .next_token = next,
-                      .next_token_logits = std::move(next_logits),
-                      .hit_eos = hit_eos};
-    if (logprobs)
-      result.logprobs.push_back(*sampling::CollectLogprobs(
-          target_executor_->CopyLastLogits(), next, logprobs));
-    return result;
+    return {.emitted_tokens = {next},
+            .accepted_count = 0,
+            .draft_count = 0,
+            .next_token = next,
+            .next_token_logits = std::move(next_logits),
+            .hit_eos = hit_eos};
   }
 
   // 1. Propose draft tokens
@@ -1039,16 +994,12 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
     ++stats_.total_verification_steps;
     ++stats_.total_emitted_tokens;
     const bool hit_eos = IsStopToken(next, eos_id);
-    StepResult result{.emitted_tokens = {next},
-                      .accepted_count = 0,
-                      .draft_count = 0,
-                      .next_token = next,
-                      .next_token_logits = std::move(next_logits),
-                      .hit_eos = hit_eos};
-    if (logprobs)
-      result.logprobs.push_back(*sampling::CollectLogprobs(
-          target_executor_->CopyLastLogits(), next, logprobs));
-    return result;
+    return {.emitted_tokens = {next},
+            .accepted_count = 0,
+            .draft_count = 0,
+            .next_token = next,
+            .next_token_logits = std::move(next_logits),
+            .hit_eos = hit_eos};
   }
 
   const std::size_t num_draft = proposal.tokens.size();
@@ -1081,7 +1032,6 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
   };
 
   target_executor_->SaveState(cur_pos);
-  std::vector<sampling::TokenLogprobs> probabilities;
   std::vector<tokenization::TokenId> target_predictions;
   target_predictions.reserve(num_draft);
 
@@ -1092,9 +1042,6 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
         target_executor_->ForwardToken(input_token, eval_pos);
     append_target_hidden(tentative_target_hidden);
     target_predictions.push_back(target_prediction);
-    if (logprobs)
-      probabilities.push_back(*sampling::CollectLogprobs(
-          target_executor_->CopyLastLogits(), target_prediction, logprobs));
     if (target_prediction != proposal.tokens[index] ||
         IsStopToken(target_prediction, eos_id)) {
       break;
@@ -1150,17 +1097,9 @@ SpeculativeVerifier::StepResult SpeculativeVerifier::VerifySequentialStep(
     }
   }
 
-  if (logprobs) {
-    probabilities.resize(accepted_count);
-    probabilities.push_back(*sampling::CollectLogprobs(
-        target_executor_->CopyLastLogits(), correction_token, logprobs));
-  }
   StepResult result;
-  result.logprobs = std::move(probabilities);
   result.draft_count = num_draft;
   result.accepted_count = accepted_count;
-  result.lookup_tokens = proposal.from_lookup ? num_draft : 0;
-  result.lookup_accepted_tokens = proposal.from_lookup ? accepted_count : 0;
 
   // Build emitted tokens: accepted draft tokens + correction token
   for (std::size_t i = 0; i < accepted_count; ++i) {

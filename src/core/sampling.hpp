@@ -35,8 +35,6 @@ struct ReasoningBudget {
 /// Filters run in this order: penalties, temperature, top-k, top-p, min-p.
 /// The defaults preserve Gufo's existing greedy decoding behavior.
 struct SamplingConfig {
-  /// Observational raw target log probabilities; null disables collection.
-  std::optional<std::uint32_t> logprobs;
   float temperature{0.0F};
   std::int32_t top_k{0};
   float top_p{1.0F};
@@ -69,26 +67,6 @@ struct Probability {
   TokenId token{0};
   double value{0.0};
 };
-
-struct LogitCandidate {
-  TokenId token;
-  float value;
-};
-
-struct TokenLogprob {
-  TokenId token{0};
-  double logprob{0};
-};
-
-struct TokenLogprobs {
-  TokenLogprob selected;
-  std::vector<TokenLogprob> top;
-};
-
-/// Full-vocabulary log-softmax before any sampling transformations.
-[[nodiscard]] std::optional<TokenLogprobs> CollectLogprobs(
-    std::span<const float> logits, TokenId selected,
-    std::optional<std::uint32_t> count);
 
 /// A normalized, post-filter sampling distribution.
 class SamplingDistribution {
@@ -180,13 +158,6 @@ public:
   /// Compact logits use token_ids for penalties; returned IDs index logits.
   [[nodiscard]] SamplingDistribution Distribution(
       std::span<const float> logits, std::span<const TokenId> token_ids) const;
-  /// Exact target top-k from a complete candidate union. The caller proves
-  /// that omitted tokens cannot enter the post-penalty top-k. Candidates
-  /// have unique vocabulary IDs; returned IDs are those vocabulary IDs.
-  /// Requires bounded top-k, positive temperature and no active constraint.
-  /// Retains the full-row sampler's FP64 filtering and normalization.
-  [[nodiscard]] SamplingDistribution DistributionFromCandidates(
-      std::span<const LogitCandidate> logits) const;
   /// Retain a speculative residual draw for the next Sample call. Copies
   /// preserve this draw along with the RNG; resetting history discards it.
   void DeferSample(TokenId token);
@@ -209,9 +180,6 @@ private:
   [[nodiscard]] SamplingDistribution LinearDistribution(
       std::span<const float> logits) const;
   void PrepareSelected(std::span<const float> logits);
-  void FilterSelected(double full_softmax_sum = 0,
-                      bool has_full_softmax_sum = false);
-  [[nodiscard]] SamplingDistribution SelectedDistribution();
   void StartReasoning();
   void AdvanceReasoning(TokenId token);
 

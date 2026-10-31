@@ -5,7 +5,6 @@ decoder. Checkpoint configuration selects the variant; 0.6B, 25Hz and GGUF
 checkpoints are unsupported. Official Python is an offline oracle only.
 
 [Benchmarks](BENCHMARKS.md) · [Quality](QUALITY.md) · [Experiments](EXPERIMENTS.md)
-· [ROCm migration](ROCM.md)
 
 ## Modes
 

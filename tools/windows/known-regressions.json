@@ -1,0 +1,54 @@
+{
+  "_comment": "Machine-readable gate for docs/WINDOWS-UPSTREAM-SYNC.md#known-upstream-regressions. The Markdown entry keeps the evidence; tools/windows/sync-inventory.ps1 and diff-guard.ps1 read this file. status 'reverted' is enforced; 'resolved' is history only. Files changed by revertSha are the watched paths. absentIdentifiers must not appear in src/ or tests/ of a candidate while the regression is reverted.",
+  "regressions": [
+    {
+      "pr": 688,
+      "repository": "gufo-org/gufo",
+      "title": "perf(qwen27b): capture DFlash2 prompt features into bounded pinned host memory",
+      "mergeSha": "b0eb5d476d07b659fb0d6a448b56f66d5420a113",
+      "status": "reverted",
+      "importMergeSha": "225ec080947a68463a39a7c0cece2322f3349cce",
+      "revertSha": "432163e929723588b57a9b798cf5ea5d7ce6c636",
+      "log": "docs/WINDOWS-UPSTREAM-SYNC.md#pr-688-windows-dflash2-continuation-latency",
+      "symptom": "Pinned capture is deferred: nine matched long-context timing cells fail across two candidate and three baseline observations. Warm sampled replay takes 405-420 ms versus 352-359 ms. The independent upload-failure drain fix remains included.",
+      "absentIdentifiers": [
+        "PromptHiddenBuffer",
+        "ReservePromptHiddenCapture",
+        "PromptHiddenChargedBytes",
+        "slot_pinned_bytes"
+      ],
+      "reintroductionChecks": [
+        "Review the Windows fix and cite the sync log; preserve the retained DFlash upload-failure drain and its native test.",
+        "Match production binary/runtime identities, model, settings, actual RAM/staging/disk capacities, and all preceding cache history.",
+        "Run affected Qwen AR/DFlash2 numerical, cancelled-prefill, image/seeded continuation, long-context/cache and batch checks, plus Flash-Next AR/MTP controls for shared cache changes.",
+        "Compare each affected request/phase at unchanged 5% and 3 ms limits with alternating candidate/base and fresh unchanged-base controls. Retain every failure and inconclusive observation; do not aggregate unmatched cancellation frontiers.",
+        "Run varied 10-16K-token fresh-process Qwen AR/DFlash2 first prompts with reuse enabled and disabled, and the standard pp2048/tg128 benchmark. Verify actual drafts, exact output and expected cache work."
+      ]
+    },
+    {
+      "pr": 699,
+      "repository": "gufo-org/gufo",
+      "title": "perf(qwen): reduce Flash-Next sampled decoding overhead",
+      "mergeSha": "e060aeed923730b74ea3f4116c3c39de55741370",
+      "status": "reverted",
+      "importMergeSha": "54fb4b4e8570999881153bb9b61c6986bb03bb6f",
+      "revertSha": "161035d8d89dc235d2fcf3e29359eaad613e62af",
+      "log": "docs/WINDOWS-UPSTREAM-SYNC.md#pr-699-windows-first-request-mtp-decode-regression",
+      "symptom": "Windows/TheRock first-request MTP decode regresses (60.90/63.35 ms against 51.32-57.51 ms baseline controls).",
+      "absentIdentifiers": [
+        "CanCompactMtpVerification",
+        "DistributionFromCandidates",
+        "GatherVerificationCandidatesKernel",
+        "LogitCandidate",
+        "SampledMtpCandidates",
+        "VerificationCandidateTileKernel"
+      ],
+      "reintroductionChecks": [
+        "Review the upstream fix and cite the sync log entry.",
+        "Fresh-process varied 10-16K-token Windows AR/MTP first-prompt controls, then repeat with prompt reuse disabled, against the previous Windows binary.",
+        "Retain every phase, output and cache/draft count; apply the 5% and 3 ms request-phase gates.",
+        "Affected Flash-Next sampling/verification correctness checks."
+      ]
+    }
+  ]
+}

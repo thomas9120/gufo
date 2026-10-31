@@ -24,16 +24,13 @@ if (ENGINE_ENABLE_HIP)
   add_qwen27b_test(qwen_sampling_hip_test sampling_test.hip
     "hip;gpu;sampling;correctness")
   target_link_libraries(qwen_sampling_hip_test PRIVATE hip::host)
-  # The CLI tests drive the gufo binary, which Windows does not build yet.
-  if (TARGET gufo)
-    add_test(NAME qwen27b.cli-options COMMAND ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py $<TARGET_FILE:gufo> --scope options)
-    set_tests_properties(qwen27b.cli-options PROPERTIES LABELS "qwen27b;cpu;cli")
-    add_test(NAME qwen27b.cli COMMAND ${Python3_EXECUTABLE}
-      ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py $<TARGET_FILE:gufo>)
-    set_tests_properties(qwen27b.cli PROPERTIES
-      LABELS "qwen27b;gpu;hip;cli;external-model" SKIP_RETURN_CODE 77)
-  endif()
+  add_test(NAME qwen27b.cli-options COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py $<TARGET_FILE:gufo> --scope options)
+  set_tests_properties(qwen27b.cli-options PROPERTIES LABELS "qwen27b;cpu;cli")
+  add_test(NAME qwen27b.cli COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.py $<TARGET_FILE:gufo>)
+  set_tests_properties(qwen27b.cli PROPERTIES
+    LABELS "qwen27b;gpu;hip;cli;external-model" SKIP_RETURN_CODE 77)
   add_qwen27b_test(qwen27b_target_test target_test.cpp
     "gpu;hip;target;external-model")
   add_qwen27b_test(qwen_mtp_gpu_test mtp_test.cpp "gpu;hip;mtp;external-model")

@@ -1,15 +1,11 @@
-#include <chrono>
-
-#include "src/core/platform/mapped_file.hpp"
-#include "src/core/platform/os_info.hpp"
+#include "src/core/platform/device_memory.hpp"
 
 static const void *g_model_host_base;
 static uint64_t g_model_registered_size;
 /* Placement for this model load, decided once from the registered weight size
  * against the device heap; see gufo::hip::WeightAllocator. */
 static std::unique_ptr<gufo::hip::WeightAllocator> g_model_weight_alloc;
-static gufo::platform::PlatformFile g_model_fd =
-    gufo::platform::kInvalidFile;
+static int g_model_fd = -1;
 static const void *g_model_fd_host_base;
 static int g_model_cache_full;
 static std::unique_ptr<gufo::hip::WeightUpload> g_model_uploader;
@@ -402,7 +398,7 @@ static int hip_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label
 
     size_t free_b = 0;
     size_t total_b = 0;
-    hipError_t err = hipMemGetInfo(&free_b, &total_b);
+    hipError_t err = gufo::platform::DeviceMemoryInfo(&free_b, &total_b);
     if (err != hipSuccess) {
         gufo::server::Logger::LogFormatted(
                 gufo::server::LogLevel::kWarn, "ds4",
@@ -605,8 +601,9 @@ static int hip_ok(hipError_t err, const char *what) {
 }
 
 static double hip_wall_sec(void) {
-    const auto now = std::chrono::steady_clock::now().time_since_epoch();
-    return std::chrono::duration<double>(now).count();
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1.0e-9;
 }
 
 static int hip_model_load_progress_enabled(void) {
@@ -626,7 +623,7 @@ static void hip_model_load_progress_note(uint64_t cached_bytes) {
     const double now = hip_wall_sec();
     if (!g_model_load_progress_started) {
         g_model_load_progress_started = 1;
-        g_model_load_progress_tty = gufo::platform::StderrIsTerminal() ? 1 : 0;
+        g_model_load_progress_tty = isatty(STDERR_FILENO) != 0;
         g_model_load_progress_next = (g_model_load_progress_tty ? 2ull : 16ull) *
                                      1024ull * 1024ull * 1024ull;
         g_model_load_progress_last = now;
@@ -727,7 +724,7 @@ static const char *hip_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what, bool wait) {
-    if (!gufo::platform::FileValid(g_model_fd) || bytes == 0) return NULL;
+    if (g_model_fd < 0 || bytes == 0) return NULL;
     if (g_model_fd_host_base != NULL && model_map != g_model_fd_host_base) return NULL;
     char* dev = hip_model_range_alloc(bytes, what);
     if (!dev) {
@@ -846,7 +843,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_host_base = NULL;
     g_model_registered_size = 0;
     g_model_weight_alloc.reset();
-    g_model_fd = gufo::platform::kInvalidFile;
+    g_model_fd = -1;
     g_model_cache_full = 0;
 }
 
@@ -901,7 +898,7 @@ extern "C" int ds4_gpu_should_use_managed_kv_cache(uint64_t kv_cache_bytes, uint
 
     size_t free_b = 0;
     size_t total_b = 0;
-    hipError_t err = hipMemGetInfo(&free_b, &total_b);
+    hipError_t err = gufo::platform::DeviceMemoryInfo(&free_b, &total_b);
     if (err != hipSuccess) {
         (void)hipGetLastError();
         return 0;
@@ -998,8 +995,7 @@ static int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     g_model_host_base = model_map;
     g_model_registered_size = model_size;
     g_model_cache_full = 0;
-    if (gufo::platform::FileValid(g_model_fd) &&
-        g_model_fd_host_base == NULL) {
+    if (g_model_fd >= 0 && g_model_fd_host_base == NULL) {
         g_model_fd_host_base = model_map;
     }
 
@@ -1027,7 +1023,7 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
-extern "C" int ds4_gpu_set_model_fd(gufo::platform::PlatformFile fd) {
+extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
     return 1;

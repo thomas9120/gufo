@@ -1,10 +1,20 @@
 #include "src/cache/disk.hpp"
 
+#include <dirent.h>
+#include <fcntl.h>
 #include <immintrin.h>
+#ifndef _WIN32
+#include <linux/fs.h>
+#endif
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
 #include <bit>
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <future>
@@ -13,11 +23,6 @@
 #include <mutex>
 #include <set>
 #include <stdexcept>
-#include <string_view>
-#include <system_error>
-#include <utility>
-
-#include "src/core/platform/fs.hpp"
 
 namespace gufo::cache {
 namespace detail {
@@ -215,51 +220,78 @@ MetadataPlan PlanMetadata(std::span<const std::uint8_t> bytes) {
 }
 class Fd {
 public:
-  explicit Fd(platform::PlatformFile value = platform::kInvalidFile)
-      : value_(value) {}
-  ~Fd() { platform::CloseFile(value_); }
-  Fd(Fd&& o) noexcept : value_(o.value_) { o.value_ = platform::kInvalidFile; }
+  explicit Fd(int value = -1) : value_(value) {}
+  ~Fd() {
+    if (value_ >= 0)
+      close(value_);
+  }
+  Fd(Fd&& o) noexcept : value_(o.value_) { o.value_ = -1; }
   Fd(const Fd&) = delete;
   Fd& operator=(const Fd&) = delete;
   Fd& operator=(Fd&&) = delete;
-  platform::PlatformFile Get() const { return value_; }
+  int Get() const { return value_; }
   void Swap(Fd& other) { std::swap(value_, other.value_); }
 
 private:
-  platform::PlatformFile value_;
+  int value_;
 };
-[[noreturn]] void IoError(const std::string& message,
-                          const std::error_code& ec) {
-  throw std::runtime_error(message + ": " + ec.message());
+[[noreturn]] void IoError(const std::string& message) {
+  throw std::runtime_error(message + ": " + std::strerror(errno));
 }
-void SyncDirectoryFd(const platform::Directory& directory) {
-  std::error_code ec;
-  if (!platform::SyncDirectory(directory, ec))
-    IoError("sync cache file/directory", ec);
+void SyncFd(int fd) {
+  int result;
+  do {
+    result = fsync(fd);
+  } while (result < 0 && errno == EINTR);
+  if (result < 0)
+    IoError("sync cache file/directory");
 }
-platform::Directory DirectoryAt(const platform::Directory& parent,
-                                const char* name) {
-  std::error_code ec;
-  if (!platform::MakeDirectoryAt(parent, name, ec))
-    IoError("create cache directory", ec);
-  auto directory = platform::OpenDirectoryAt(parent, name, ec);
-  if (!directory.valid())
-    IoError(std::string("open cache directory ") + name, ec);
+Fd DirectoryAt(int parent, const char* name) {
+  if (mkdirat(parent, name, 0700) < 0 && errno != EEXIST)
+    IoError("create cache directory");
+  const int fd =
+      openat(parent, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0)
+    IoError(std::string("open cache directory ") + name);
+  Fd directory(fd);
+#ifdef _WIN32
+  struct stat st{};
+  if (fstat(fd, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+      (st.st_mode & 0777) != 0700)
+    throw std::runtime_error(std::string("cache directory must be private: ") +
+                             name);
+#endif
   return directory;
 }
 template<typename F>
-void Scan(const platform::Directory& directory, F visit) {
-  std::error_code ec;
-  if (!platform::ListDirectory(
-          directory,
-          [&](std::string_view name, const platform::FileInfo& info) {
-            // ListDirectory reports every entry; callers expect regular
-            // files only.
-            if (info.regular)
-              visit(std::string(name), info);
-          },
-          ec))
-    IoError("scan cache directory", ec);
+void Scan(int fd, F visit) {
+  const int copy = openat(fd, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (copy < 0)
+    IoError("open cache scan");
+  auto close_directory = [](DIR* d) { closedir(d); };
+  const std::unique_ptr<DIR, decltype(close_directory)> dir(fdopendir(copy),
+                                                            close_directory);
+  if (!dir) {
+    close(copy);
+    IoError("scan cache directory");
+  }
+  for (;;) {
+    errno = 0;
+    auto* entry = readdir(dir.get());
+    if (!entry) {
+      if (errno)
+        IoError("read cache directory");
+      break;
+    }
+    const std::string name(entry->d_name);
+    if (name == "." || name == "..")
+      continue;
+    struct stat st{};
+    if (fstatat(fd, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) < 0)
+      IoError("stat cache file");
+    if (S_ISREG(st.st_mode) && st.st_size >= 0)
+      visit(name, st);
+  }
 }
 std::optional<DiskFileId> ParseName(const std::string& name) {
   if (name.size() != 36 || name.substr(32) != ".bin")
@@ -280,8 +312,12 @@ std::optional<DiskFileId> ParseName(const std::string& name) {
   }
   return id;
 }
-bool Regular(const platform::FileInfo& info) {
-  return info.regular && info.links == 1;
+bool Regular(const struct stat& st) {
+#ifdef _WIN32
+  if (st.st_uid != geteuid() || (st.st_mode & 0777) != 0600)
+    return false;
+#endif
+  return S_ISREG(st.st_mode) && st.st_size >= 0 && st.st_nlink == 1;
 }
 bool Contains(const DiskManifest& manifest, bool private_file,
               const DiskPayload& payload) {
@@ -384,8 +420,15 @@ __attribute__((target("pclmul,ssse3"))) std::uint64_t ChecksumFold(
 }  // namespace
 std::uint64_t DiskChecksum(std::span<const std::uint8_t> bytes,
                            std::uint64_t crc) {
+#ifdef _WIN32
+  // TheRock clang links -nostdlib on Windows, so the compiler-rt symbol behind
+  // __builtin_cpu_supports is absent. Every Windows x64 target allowed by this
+  // port (gfx1151 Strix Halo and the Windows 11 CI image) has both features.
+  static constexpr bool folding = true;
+#else
   static const bool folding =
       __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("ssse3");
+#endif
   if (folding && bytes.size() >= 256)
     return ChecksumFold(bytes, crc);
   return ChecksumTable(bytes, crc);
@@ -505,9 +548,7 @@ std::string DiskFileName(DiskFileId id) {
 struct DiskStore::Impl {
   ResourceLedger* ledger;
   ResourceCharge metadata, entry_capacity;
-  platform::Directory root;
-  Fd lock;
-  platform::Directory version, manifests, chunks, private_files, temporary;
+  Fd root, lock, version, manifests, chunks, private_files, temporary;
   DiskStartupStats stats;
   std::vector<DurableEntry> entries;
   std::uint64_t budget_bytes;
@@ -519,9 +560,18 @@ struct DiskStore::Impl {
   mutable std::mutex index_mutex;
   mutable std::mutex stats_mutex;
   struct FileIdentity {
-    platform::FileInfo info;
+    dev_t device;
+    ino_t inode;
+    off_t size;
+    timespec modified, changed;
     std::uint64_t checksum;
-    bool operator==(const FileIdentity& b) const = default;
+    bool operator==(const FileIdentity& b) const {
+      return device == b.device && inode == b.inode && size == b.size &&
+             modified.tv_sec == b.modified.tv_sec &&
+             modified.tv_nsec == b.modified.tv_nsec &&
+             changed.tv_sec == b.changed.tv_sec &&
+             changed.tv_nsec == b.changed.tv_nsec && checksum == b.checksum;
+    }
   };
   struct VerifiedFile {
     ResourceCharge charge;
@@ -586,35 +636,50 @@ struct DiskStore::Impl {
       : ledger(&l),
         metadata(reservation.Convert()),
         root(OpenRoot(path)),
-        lock(OpenLock(root, path)),
-        version(DirectoryAt(root, "v2")),
-        manifests(DirectoryAt(version, "manifests")),
-        chunks(DirectoryAt(version, "chunks")),
-        private_files(DirectoryAt(version, "private")),
-        temporary(DirectoryAt(version, "tmp")),
+        lock(OpenLock(root.Get(), path)),
+        version(DirectoryAt(root.Get(), "v2")),
+        manifests(DirectoryAt(version.Get(), "manifests")),
+        chunks(DirectoryAt(version.Get(), "chunks")),
+        private_files(DirectoryAt(version.Get(), "private")),
+        temporary(DirectoryAt(version.Get(), "tmp")),
         budget_bytes(budget) {
-    // Persist the layout, including a newly created root and ancestors, before
-    // any checkpoint can rely on these directory entries.
-    SyncDirectoryFd(version);
-    SyncDirectoryFd(root);
-    std::error_code ec;
-    if (!platform::SyncAncestors(root, ec))
-      IoError("sync cache ancestors", ec);
+    // Flush the layout before any checkpoint relies on its directory entries.
+    for (int fd : {version.Get(), root.Get()})
+      SyncFd(fd);
+    // Linux also persists a new root through all its ancestors. Windows
+    // checkpoints are rebuildable: no write access to profile/volume ancestors
+    // is required and namespace persistence across power loss is not promised.
+#ifndef _WIN32
+    Fd ancestor(openat(root.Get(), "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+    for (;;) {
+      if (ancestor.Get() < 0)
+        IoError("open cache parent");
+      SyncFd(ancestor.Get());
+      Fd parent(
+          openat(ancestor.Get(), "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC));
+      struct stat a{}, b{};
+      if (parent.Get() < 0 || fstat(ancestor.Get(), &a) < 0 ||
+          fstat(parent.Get(), &b) < 0)
+        IoError("stat cache parent");
+      if (a.st_dev == b.st_dev && a.st_ino == b.st_ino)
+        break;
+      ancestor.Swap(parent);
+    }
+#endif
     CleanupLegacy();
     std::size_t manifest_count{};
-    for (const platform::Directory* directory :
-         {&manifests, &chunks, &private_files})
-      Scan(*directory,
-           [&](const std::string& name, const platform::FileInfo& st) {
-             if (ParseName(name)) {
-               stats.managed_bytes = Add(stats.managed_bytes, st.size);
-               if (directory == &manifests)
-                 ++manifest_count;
-             }
-           });
-    Scan(temporary, [&](const std::string& name, const platform::FileInfo& st) {
+    for (const int directory :
+         {manifests.Get(), chunks.Get(), private_files.Get()})
+      Scan(directory, [&](const std::string& name, const struct stat& st) {
+        if (ParseName(name)) {
+          stats.managed_bytes = Add(stats.managed_bytes, st.st_size);
+          if (directory == manifests.Get())
+            ++manifest_count;
+        }
+      });
+    Scan(temporary.Get(), [&](const std::string& name, const struct stat& st) {
       if (ParseName(name))
-        stats.managed_bytes = Add(stats.managed_bytes, st.size);
+        stats.managed_bytes = Add(stats.managed_bytes, st.st_size);
     });
     if (manifest_count) {
       auto entry_reservation =
@@ -627,7 +692,7 @@ struct DiskStore::Impl {
       entry_capacity = entry_reservation.Convert();
       entries.swap(allocated);
     }
-    Scan(manifests, [&](const std::string& name, const platform::FileInfo& st) {
+    Scan(manifests.Get(), [&](const std::string& name, const struct stat& st) {
       auto id = ParseName(name);
       if (!id)
         return;
@@ -637,10 +702,10 @@ struct DiskStore::Impl {
         bool available = true;
         for (const auto& c : m.components) {
           for (const auto& p : c.chunks)
-            available = Check(chunks, p) && available;
+            available = Check(chunks.Get(), p) && available;
           for (auto p : {c.tail, c.private_state})
             if (p)
-              available = Check(private_files, *p) && available;
+              available = Check(private_files.Get(), *p) && available;
         }
         if (!available)
           Invalid();
@@ -659,9 +724,9 @@ struct DiskStore::Impl {
     // A process abort can leave unsynced renames or deletions in any managed
     // namespace. Persist the discovered namespace before exposing entries or
     // spending deletion credits; no payload reads or orphan cleanup are needed.
-    for (const platform::Directory* directory :
-         {&manifests, &chunks, &private_files, &temporary})
-      SyncDirectoryFd(*directory);
+    for (int fd :
+         {manifests.Get(), chunks.Get(), private_files.Get(), temporary.Get()})
+      SyncFd(fd);
     std::sort(entries.begin(), entries.end(),
               [](const auto& a, const auto& b) { return a.file_ < b.file_; });
   }
@@ -748,60 +813,49 @@ struct DiskStore::Impl {
       return remove;
     });
   }
-  void Sync(platform::PlatformFile file) {
+  void Sync(int fd) {
     auto begin = std::chrono::steady_clock::now();
-    std::error_code ec;
-    const bool synced = platform::SyncFile(file, ec);
+    int result;
+    do {
+      result = fsync(fd);
+    } while (result < 0 && errno == EINTR);
     ++publication_stats.fsync_calls;
     publication_stats.fsync_ns +=
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - begin)
             .count();
-    if (!synced)
-      IoError("sync cache file/directory", ec);
+    if (result < 0)
+      IoError("sync cache file/directory");
   }
-  void Sync(const platform::Directory& directory) {
-    auto begin = std::chrono::steady_clock::now();
-    std::error_code ec;
-    const bool synced = platform::SyncDirectory(directory, ec);
-    ++publication_stats.fsync_calls;
-    publication_stats.fsync_ns +=
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now() - begin)
-            .count();
-    if (!synced)
-      IoError("sync cache file/directory", ec);
-  }
-  void Remove(const platform::Directory& directory, const std::string& name) {
-    platform::FileInfo st{};
-    std::error_code ec;
-    if (!platform::StatAt(directory, name, false, &st, ec)) {
-      if (ec == std::errc::no_such_file_or_directory)
+  void Remove(int directory, const std::string& name) {
+    struct stat st{};
+    if (fstatat(directory, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) < 0) {
+      if (errno == ENOENT)
         return;
-      IoError("stat cache removal", ec);
+      IoError("stat cache removal");
     }
     if (!Regular(st))
       return;
-    if (&directory == &chunks || &directory == &private_files)
+    if (directory == chunks.Get() || directory == private_files.Get())
       if (auto id = ParseName(name))
-        ForgetVerified({&directory == &private_files, *id});
-    if (!platform::Unlink(directory, name, ec))
-      IoError("remove cache file", ec);
+        ForgetVerified({directory == private_files.Get(), *id});
+    if (unlinkat(directory, name.c_str(), 0) < 0)
+      IoError("remove cache file");
     {
       std::lock_guard guard(stats_mutex);
-      stats.managed_bytes -= st.size;
+      stats.managed_bytes -= st.st_size;
     }
   }
-  bool Referenced(const platform::Directory& directory, DiskFileId id) const {
+  bool Referenced(int directory, DiskFileId id) const {
     for (const auto& entry : entries) {
-      if (&directory == &manifests && entry.file_ == id)
+      if (directory == manifests.Get() && entry.file_ == id)
         return true;
       for (const auto& c : entry.manifest_.components) {
-        if (&directory == &chunks)
+        if (directory == chunks.Get())
           for (const auto& p : c.chunks)
             if (p.file == id)
               return true;
-        if (&directory == &private_files)
+        if (directory == private_files.Get())
           for (auto p : {c.tail, c.private_state})
             if (p && p->file == id)
               return true;
@@ -821,29 +875,28 @@ struct DiskStore::Impl {
     recovery_required = true;
     // Even invalid manifests are removed and that removal made durable before
     // dependencies: a crash must never resurrect a manifest with deleted bytes.
-    Scan(manifests, [&](const auto& name, const auto&) {
+    Scan(manifests.Get(), [&](const auto& name, const auto&) {
       auto id = ParseName(name);
-      if (id && !Referenced(manifests, *id))
-        Remove(manifests, name);
+      if (id && !Referenced(manifests.Get(), *id))
+        Remove(manifests.Get(), name);
     });
-    Sync(manifests);
-    for (const platform::Directory* directory :
-         {&chunks, &private_files, &temporary}) {
-      Scan(*directory, [&](const auto& name, const auto&) {
+    Sync(manifests.Get());
+    for (int directory : {chunks.Get(), private_files.Get(), temporary.Get()}) {
+      Scan(directory, [&](const auto& name, const auto&) {
         auto id = ParseName(name);
-        if (id && !Referenced(*directory, *id))
-          Remove(*directory, name);
+        if (id && !Referenced(directory, *id))
+          Remove(directory, name);
       });
-      Sync(*directory);
+      Sync(directory);
     }
     // A failed unlink syscall can leave its outcome uncertain. Reconcile the
     // conservative charge with the actual namespace after successful cleanup.
     std::uint64_t managed{};
-    for (const platform::Directory* directory :
-         {&manifests, &chunks, &private_files, &temporary})
-      Scan(*directory, [&](const auto& name, const auto& st) {
+    for (int directory :
+         {manifests.Get(), chunks.Get(), private_files.Get(), temporary.Get()})
+      Scan(directory, [&](const auto& name, const auto& st) {
         if (ParseName(name))
-          managed = Add(managed, st.size);
+          managed = Add(managed, st.st_size);
       });
     {
       std::lock_guard guard(stats_mutex);
@@ -851,27 +904,28 @@ struct DiskStore::Impl {
     }
     recovery_required = false;
   }
-  void Rename(const platform::Directory& target, const std::string& name) {
+  void Rename(int target, const std::string& name) {
     CostTimer timer(publication_stats.filesystem_ns);
-    std::error_code ec;
-    if (platform::RenameNoReplace(temporary, name, target, name, ec) !=
-        platform::RenameResult::kRenamed)
-      IoError("publish cache file", ec);
+#ifdef _WIN32
+    if (gufo_rename_noreplace(temporary.Get(), name.c_str(), target,
+                              name.c_str()) < 0)
+#else
+    if (syscall(SYS_renameat2, temporary.Get(), name.c_str(), target,
+                name.c_str(), RENAME_NOREPLACE) < 0)
+#endif
+      IoError("publish cache file");
   }
-  void WriteFile(platform::PlatformFile fd,
-                 std::span<const std::uint8_t> bytes) {
+  void WriteFile(int fd, std::span<const std::uint8_t> bytes) {
     while (!bytes.empty()) {
-      std::size_t n;
+      ssize_t n;
       {
         CostTimer timer(publication_stats.filesystem_ns);
-        std::error_code ec;
-        n = platform::Write(fd, bytes.data(), bytes.size(), ec);
-        if (n == 0) {
-          if (ec == std::errc::interrupted)
-            continue;
-          IoError("write cache file", ec);
-        }
+        n = write(fd, bytes.data(), bytes.size());
       }
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        IoError("write cache file");
       {
         std::unique_lock guard(stats_mutex, std::defer_lock);
         {
@@ -885,22 +939,20 @@ struct DiskStore::Impl {
   }
   Fd Create(const std::string& name) {
     CostTimer timer(publication_stats.filesystem_ns);
-    std::error_code ec;
-    Fd fd(
-        platform::OpenAt(temporary, name, platform::FileMode::kCreateNew, ec));
-    if (!platform::FileValid(fd.Get()))
-      IoError("create temporary cache file", ec);
+    Fd fd(openat(temporary.Get(), name.c_str(),
+                 O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600));
+    if (fd.Get() < 0)
+      IoError("create temporary cache file");
     return fd;
   }
-  bool Exists(const platform::Directory& directory, const std::string& name) {
+  bool Exists(int directory, const std::string& name) {
     CostTimer timer(publication_stats.filesystem_ns);
-    platform::FileInfo st{};
-    std::error_code ec;
-    if (platform::StatAt(directory, name, false, &st, ec))
+    struct stat st{};
+    if (fstatat(directory, name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0)
       return true;
-    if (ec == std::errc::no_such_file_or_directory)
-      return false;
-    IoError("stat publication destination", ec);
+    if (errno != ENOENT)
+      IoError("stat publication destination");
+    return false;
   }
   void Quarantine(bool private_file, DiskFileId file) {
     std::lock_guard guard(index_mutex);
@@ -931,7 +983,7 @@ struct DiskStore::Impl {
     result->metadata = admission.Convert();
     return result;
   }
-  void Verify(const platform::Directory& directory, const DiskPayload& payload,
+  void Verify(int directory, const DiskPayload& payload,
               std::span<std::uint8_t> staging = {},
               const DiskStagingAccess* access = nullptr) {
     // Reject a caller's conflicting claim without poisoning existing owners.
@@ -940,7 +992,7 @@ struct DiskStore::Impl {
       std::lock_guard guard(index_mutex);
       for (const auto& entry : entries)
         for (const auto& component : entry.manifest_.components) {
-          if (&directory == &private_files) {
+          if (directory == private_files.Get()) {
             for (const auto& existing :
                  {component.tail, component.private_state})
               if (existing && existing->file == payload.file &&
@@ -953,28 +1005,28 @@ struct DiskStore::Impl {
           }
         }
     }
-    std::error_code ec;
-    platform::PlatformFile descriptor;
+    int descriptor;
+    struct stat st{};
     {
       CostTimer timer(publication_stats.filesystem_ns);
-      descriptor = platform::OpenAt(directory, DiskFileName(payload.file),
-                                    platform::FileMode::kRead, ec);
+      descriptor = openat(directory, DiskFileName(payload.file).c_str(),
+                          O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
     }
     Fd fd(descriptor);
-    platform::FileInfo st{};
     int status;
     {
       CostTimer timer(publication_stats.filesystem_ns);
-      status = platform::Stat(fd.Get(), &st, ec) ? 0 : -1;
+      status = fstat(fd.Get(), &st);
     }
-    const bool private_file = &directory == &private_files;
-    if (!platform::FileValid(fd.Get()) || status < 0 || !Regular(st) ||
-        st.size != payload.bytes)
+    const bool private_file = directory == private_files.Get();
+    if (fd.Get() < 0 || status < 0 || !Regular(st) ||
+        std::uint64_t(st.st_size) != payload.bytes)
       DependencyFailure(private_file, payload.file);
     // Each publication inherits the chunks of earlier checkpoints. Re-read
     // only those whose identity changed since this store last verified them.
     const auto key = std::make_pair(private_file, payload.file);
-    const FileIdentity identity{st, payload.checksum};
+    const FileIdentity identity{st.st_dev,  st.st_ino,  st.st_size,
+                                st.st_mtim, st.st_ctim, payload.checksum};
     if (VerificationCached(key, identity))
       return;
     ResourceReservation charge;
@@ -992,37 +1044,41 @@ struct DiskStore::Impl {
       }};
       if (access)
         access->acquire();
-      std::size_t n;
+      ssize_t n;
       {
         CostTimer timer(publication_stats.filesystem_ns);
-        n = platform::Read(fd.Get(), staging.data(),
-                           std::min<std::uint64_t>(remaining, staging.size()),
-                           ec);
+        n = read(fd.Get(), staging.data(),
+                 std::min<std::uint64_t>(remaining, staging.size()));
       }
-      if (n == 0 && ec == std::errc::interrupted)
+      if (n < 0 && errno == EINTR)
         continue;
-      if (n == 0)
-        DependencyFailure(&directory == &private_files, payload.file);
+      if (n <= 0)
+        DependencyFailure(directory == private_files.Get(), payload.file);
       {
         CostTimer timer(publication_stats.checksum_ns);
         crc = DiskChecksum(staging.first(n), crc);
       }
       remaining -= n;
     }
-    platform::FileInfo after{};
+    struct stat after{};
     int final_status;
     {
       CostTimer timer(publication_stats.filesystem_ns);
-      final_status = platform::Stat(fd.Get(), &after, ec) ? 0 : -1;
+      final_status = fstat(fd.Get(), &after);
     }
     if (crc != payload.checksum || final_status < 0 || !Regular(after) ||
-        !(st == after))
+        st.st_dev != after.st_dev || st.st_ino != after.st_ino ||
+        st.st_size != after.st_size ||
+        st.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+        st.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+        st.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+        st.st_ctim.tv_nsec != after.st_ctim.tv_nsec)
       DependencyFailure(private_file, payload.file);
     RememberVerified(key, identity);
     {
       // Verified; drop the pages this re-read brought in.
       CostTimer timer(publication_stats.filesystem_ns);
-      platform::Advise(fd.Get(), platform::AdviseHint::kDontNeed, 0, 0);
+      (void)posix_fadvise(fd.Get(), 0, 0, POSIX_FADV_DONTNEED);
     }
   }
   void Publish(DiskFileId file, const DiskManifest& m,
@@ -1058,7 +1114,7 @@ struct DiskStore::Impl {
         std::make_shared<const ResourceCharge>(pin_reservation.Convert());
     candidate.metadata_ = retained.Convert();
     auto name = DiskFileName(file);
-    if (Exists(manifests, name) || Exists(temporary, name))
+    if (Exists(manifests.Get(), name) || Exists(temporary.Get(), name))
       Invalid();
     std::map<std::pair<bool, DiskFileId>, DiskPayload> dependencies;
     for (const auto& c : m.components) {
@@ -1112,7 +1168,8 @@ struct DiskStore::Impl {
     if (check_capacity) {
       std::uint64_t required = bytes.size();
       for (const auto& [key, payload] : dependencies)
-        if (!Referenced(key.first ? private_files : chunks, payload.file))
+        if (!Referenced(key.first ? private_files.Get() : chunks.Get(),
+                        payload.file))
           required = Add(required, payload.bytes);
       // Eviction can retry this publication many times. Refuse it before
       // reading and checksumming the shared prefix on every failed attempt.
@@ -1122,7 +1179,7 @@ struct DiskStore::Impl {
     }
     std::uint64_t additional = bytes.size();
     for (auto& [key, p] : dependencies) {
-      const platform::Directory& dir = key.first ? private_files : chunks;
+      int dir = key.first ? private_files.Get() : chunks.Get();
       if (Referenced(dir, p.file)) {
         // Streamed captures do not hash their immutable sources up front.
         // A queued continuation may reuse a chunk published by an earlier
@@ -1168,7 +1225,7 @@ struct DiskStore::Impl {
         continue;
       }
       if (Exists(dir, DiskFileName(p.file)) ||
-          Exists(temporary, DiskFileName(p.file)))
+          Exists(temporary.Get(), DiskFileName(p.file)))
         Invalid();
       if (p.file == file)
         Invalid();  // temporary namespace is shared
@@ -1231,7 +1288,7 @@ struct DiskStore::Impl {
       // filesystem existence after validating claims, never from this
       // candidate.
       for (auto& [key, p] : dependencies) {
-        const platform::Directory& dir = key.first ? private_files : chunks;
+        int dir = key.first ? private_files.Get() : chunks.Get();
         auto payload_name = DiskFileName(p.file);
         if (Exists(dir, payload_name))
           continue;
@@ -1288,17 +1345,17 @@ struct DiskStore::Impl {
           // The payload is durable; drop its clean pages so multi-GB snapshots
           // don't accumulate in the page cache.
           CostTimer timer(publication_stats.filesystem_ns);
-          platform::Advise(fd.Get(), platform::AdviseHint::kDontNeed, 0, 0);
+          (void)posix_fadvise(fd.Get(), 0, 0, POSIX_FADV_DONTNEED);
         }
         DISK_STEP(kPayloadSynced);
         Rename(dir, payload_name);
         DISK_STEP(kPayloadRenamed);
       }
-      Sync(temporary);
+      Sync(temporary.Get());
       DISK_STEP(kTemporaryDirectorySynced);
-      Sync(chunks);
+      Sync(chunks.Get());
       DISK_STEP(kChunkDirectorySynced);
-      Sync(private_files);
+      Sync(private_files.Get());
       DISK_STEP(kDependenciesSynced);
       index_guard.lock();
       if (!entries.back().available_)
@@ -1315,11 +1372,11 @@ struct DiskStore::Impl {
       Sync(fd.Get());
       DISK_STEP(kManifestSynced);
       manifest_attempted = true;
-      Rename(manifests, name);
+      Rename(manifests.Get(), name);
       DISK_STEP(kManifestRenamed);
-      Sync(manifests);
+      Sync(manifests.Get());
       DISK_STEP(kManifestDirectorySynced);
-      Sync(temporary);
+      Sync(temporary.Get());
       DISK_STEP(kFinalTemporaryDirectorySynced);
       index_guard.lock();
       if (!entries.back().available_)
@@ -1338,7 +1395,7 @@ struct DiskStore::Impl {
       throw;
     }
   }
-  static platform::Directory OpenRoot(const std::filesystem::path& path) {
+  static Fd OpenRoot(const std::filesystem::path& path) {
     // Do not collapse '..': an earlier component may be a symlink and the
     // kernel's configured-directory resolution must remain authoritative.
     auto root_path = path;
@@ -1347,24 +1404,30 @@ struct DiskStore::Impl {
       root_path = root_path.parent_path();
     if (root_path.empty())
       root_path = ".";
+#ifdef _WIN32
+    const int fd = gufo_open_cache_directory(root_path.c_str());
+    if (fd < 0)
+      IoError(
+          "open Windows cache directory (use a new private local NTFS "
+          "folder without '..' or reparse points)");
+#else
     std::filesystem::create_directories(root_path);
-    platform::Directory directory;
-    std::error_code ec;
-    if (!directory.Open(root_path, ec))
-      IoError("open cache directory " + path.string(), ec);
-    return directory;
+    const int fd = open(root_path.c_str(),
+                        O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+      IoError("open cache directory " + path.string());
+#endif
+    return Fd(fd);
   }
-  static Fd OpenLock(const platform::Directory& root,
-                     const std::filesystem::path& path) {
-    std::error_code ec;
-    Fd lock(
-        platform::OpenAt(root, "LOCK", platform::FileMode::kOpenOrCreate, ec));
-    platform::FileInfo st{};
-    if (!platform::FileValid(lock.Get()) ||
-        !platform::Stat(lock.Get(), &st, ec) || !Regular(st))
+  static Fd OpenLock(int root, const std::filesystem::path& path) {
+    Fd lock(openat(root, "LOCK",
+                   O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
+                   0600));
+    struct stat st{};
+    if (lock.Get() < 0 || fstat(lock.Get(), &st) < 0 || !Regular(st))
       throw std::runtime_error("invalid cache ownership lock in " +
                                path.string());
-    if (!platform::TryLockExclusive(lock.Get(), ec))
+    if (flock(lock.Get(), LOCK_EX | LOCK_NB) < 0)
       throw std::runtime_error(
           "cache directory ownership unavailable (another process may own "
           "it): " +
@@ -1372,28 +1435,26 @@ struct DiskStore::Impl {
     return lock;
   }
   void CleanupLegacy() {
-    Scan(root, [&](const std::string& name, const platform::FileInfo& st) {
+    Scan(root.Get(), [&](const std::string& name, const struct stat& st) {
       if (!Regular(st))
         return;
       bool managed = name.starts_with(".tmp-");
       if (!managed && name.ends_with(".kvc")) {
-        std::error_code ec;
-        const Fd file(
-            platform::OpenAt(root, name, platform::FileMode::kRead, ec));
-        platform::FileInfo current{};
-        if (!platform::FileValid(file.Get()) ||
-            !platform::Stat(file.Get(), &current, ec) || !Regular(current))
+        const Fd file(openat(root.Get(), name.c_str(),
+                             O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+        struct stat current{};
+        if (file.Get() < 0 || fstat(file.Get(), &current) < 0 ||
+            !Regular(current))
           return;
         std::array<char, 4> magic{};
         std::size_t offset{};
         while (offset < magic.size()) {
-          std::error_code read_ec;
-          const auto n = platform::Read(file.Get(), magic.data() + offset,
-                                        magic.size() - offset, read_ec);
-          if (n == 0 && read_ec == std::errc::interrupted)
+          auto n =
+              read(file.Get(), magic.data() + offset, magic.size() - offset);
+          if (n < 0 && errno == EINTR)
             continue;
-          if (n == 0 && read_ec)
-            IoError("read legacy cache magic", read_ec);
+          if (n < 0)
+            IoError("read legacy cache magic");
           if (!n)
             break;
           offset += n;
@@ -1403,36 +1464,32 @@ struct DiskStore::Impl {
                   magic == std::array<char, 4>{'G', 'U', 'F', 'O'};
       }
       if (managed) {
-        std::error_code ec;
-        if (!platform::Unlink(root, name, ec))
-          IoError("remove legacy cache file", ec);
-        stats.removed_legacy_bytes = Add(stats.removed_legacy_bytes, st.size);
+        if (unlinkat(root.Get(), name.c_str(), 0) < 0)
+          IoError("remove legacy cache file");
+        stats.removed_legacy_bytes =
+            Add(stats.removed_legacy_bytes, st.st_size);
       }
     });
   }
-  DurableEntry ReadManifest(const std::string& name,
-                            const platform::FileInfo& found) {
-    if (!Regular(found) || found.size < 20 || found.size > kMaxManifestBytes)
+  DurableEntry ReadManifest(const std::string& name, const struct stat& found) {
+    if (!Regular(found) || found.st_size < 20 ||
+        std::uint64_t(found.st_size) > kMaxManifestBytes)
       Invalid();
-    std::error_code ec;
-    const Fd file(
-        platform::OpenAt(manifests, name, platform::FileMode::kRead, ec));
-    platform::FileInfo st{};
-    if (!platform::FileValid(file.Get()) ||
-        !platform::Stat(file.Get(), &st, ec) || !Regular(st) ||
-        st.size != found.size)
+    const Fd file(openat(manifests.Get(), name.c_str(),
+                         O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    struct stat st{};
+    if (file.Get() < 0 || fstat(file.Get(), &st) < 0 || !Regular(st) ||
+        st.st_size != found.st_size)
       Invalid();
     auto read_reservation =
-        ledger->Reserve(ResourceCategory::kMetadata, st.size);
-    std::vector<std::uint8_t> bytes(st.size);
+        ledger->Reserve(ResourceCategory::kMetadata, st.st_size);
+    std::vector<std::uint8_t> bytes(st.st_size);
     std::size_t offset{};
     while (offset < bytes.size()) {
-      std::error_code read_ec;
-      const auto n = platform::Read(file.Get(), bytes.data() + offset,
-                                    bytes.size() - offset, read_ec);
-      if (n == 0 && read_ec == std::errc::interrupted)
+      auto n = read(file.Get(), bytes.data() + offset, bytes.size() - offset);
+      if (n < 0 && errno == EINTR)
         continue;
-      if (n == 0)
+      if (n <= 0)
         Invalid();
       offset += n;
       stats.manifest_bytes_read += n;
@@ -1465,12 +1522,12 @@ struct DiskStore::Impl {
       entry.metadata_ = retained.Convert();
     return entry;
   }
-  bool Check(const platform::Directory& directory, const DiskPayload& p) {
+  bool Check(int directory, const DiskPayload& p) {
     ++stats.dependency_stats;
-    platform::FileInfo st{};
-    std::error_code ec;
-    return platform::StatAt(directory, DiskFileName(p.file), false, &st, ec) &&
-           Regular(st) && st.size == p.bytes;
+    struct stat st{};
+    return fstatat(directory, DiskFileName(p.file).c_str(), &st,
+                   AT_SYMLINK_NOFOLLOW) == 0 &&
+           Regular(st) && std::uint64_t(st.st_size) == p.bytes;
   }
 };
 DurableEntry& DurableEntry::operator=(DurableEntry&& other) noexcept {
@@ -1570,19 +1627,20 @@ void DiskStore::PrefetchPayload(const DiskSnapshot& snapshot, bool private_file,
                                 const DiskPayload& payload,
                                 std::uint64_t bytes) const {
   if (snapshot.store_ != impl_.get() || !snapshot.pin_ ||
-      !Contains(snapshot.manifest_, private_file, payload))
+      !Contains(snapshot.manifest_, private_file, payload) ||
+      bytes > std::uint64_t(std::numeric_limits<off_t>::max()))
     throw std::invalid_argument("invalid disk prefetch dependency");
   bytes = std::min(bytes, payload.bytes);
   if (!bytes)
     return;
-  const auto& directory = private_file ? impl_->private_files : impl_->chunks;
-  std::error_code ec;
-  Fd file(platform::OpenAt(directory, DiskFileName(payload.file),
-                           platform::FileMode::kRead, ec));
-  platform::FileInfo status{};
-  if (platform::FileValid(file.Get()) &&
-      platform::Stat(file.Get(), &status, ec) && Regular(status))
-    platform::Advise(file.Get(), platform::AdviseHint::kWillNeed, 0, bytes);
+  const int directory =
+      private_file ? impl_->private_files.Get() : impl_->chunks.Get();
+  Fd file(openat(directory, DiskFileName(payload.file).c_str(),
+                 O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
+  struct stat status{};
+  if (file.Get() >= 0 && fstat(file.Get(), &status) == 0 && Regular(status))
+    (void)posix_fadvise(file.Get(), 0, static_cast<off_t>(bytes),
+                        POSIX_FADV_WILLNEED);
 }
 DiskReadStats DiskStore::ReadPayload(
     const DiskSnapshot& snapshot, bool private_file, const DiskPayload& payload,
@@ -1607,16 +1665,17 @@ DiskReadStats DiskStore::ReadPayload(
       *observation = stats;
   }};
   auto begin = Clock::now();
-  const auto& directory = private_file ? impl_->private_files : impl_->chunks;
-  std::error_code ec;
-  Fd file(platform::OpenAt(directory, DiskFileName(payload.file),
-                           platform::FileMode::kRead, ec));
-  platform::FileInfo before{}, after{};
-  if (!platform::FileValid(file.Get()) ||
-      !platform::Stat(file.Get(), &before, ec) || !Regular(before) ||
-      before.size != payload.bytes)
+  const int directory =
+      private_file ? impl_->private_files.Get() : impl_->chunks.Get();
+  Fd file(openat(directory, DiskFileName(payload.file).c_str(),
+                 O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK));
+  struct stat before{}, after{};
+  if (file.Get() < 0 || fstat(file.Get(), &before) < 0 || !Regular(before) ||
+      std::uint64_t(before.st_size) != payload.bytes)
     impl_->DependencyFailure(private_file, payload.file);
-  const Impl::FileIdentity identity{before, payload.checksum};
+  const Impl::FileIdentity identity{before.st_dev,  before.st_ino,
+                                    before.st_size, before.st_mtim,
+                                    before.st_ctim, payload.checksum};
   stats.filesystem_ns += elapsed(begin);
   const auto key = std::make_pair(private_file, payload.file);
   stats.verification_cached = impl_->VerificationCached(key, identity);
@@ -1627,11 +1686,10 @@ DiskReadStats DiskStore::ReadPayload(
     begin = Clock::now();
     std::size_t filled{};
     while (filled < piece.size()) {
-      const auto n = platform::Read(file.Get(), piece.data() + filled,
-                                    piece.size() - filled, ec);
-      if (n == 0 && ec == std::errc::interrupted)
+      auto n = read(file.Get(), piece.data() + filled, piece.size() - filled);
+      if (n < 0 && errno == EINTR)
         continue;
-      if (n == 0)
+      if (n <= 0)
         impl_->DependencyFailure(private_file, payload.file);
       filled += n;
     }
@@ -1646,12 +1704,14 @@ DiskReadStats DiskStore::ReadPayload(
     offset += piece.size();
   }
   begin = Clock::now();
-  if (!platform::Stat(file.Get(), &after, ec) || !Regular(after) ||
-      identity.info != after ||
+  if (fstat(file.Get(), &after) < 0 || !Regular(after) ||
+      identity != Impl::FileIdentity{after.st_dev, after.st_ino, after.st_size,
+                                     after.st_mtim, after.st_ctim,
+                                     payload.checksum} ||
       (!stats.verification_cached && checksum != payload.checksum))
     impl_->DependencyFailure(private_file, payload.file);
   // The consumer holds the bytes now; drop the page-cache copy.
-  platform::Advise(file.Get(), platform::AdviseHint::kDontNeed, 0, 0);
+  (void)posix_fadvise(file.Get(), 0, 0, POSIX_FADV_DONTNEED);
   stats.filesystem_ns += elapsed(begin);
   if (!stats.verification_cached)
     impl_->RememberVerified(key, identity);
@@ -1686,18 +1746,18 @@ DiskRetireResult DiskStore::Impl::Retire(CheckpointId id, std::uint64_t epoch) {
   entries.erase(it);
   index_guard.unlock();
   try {
-    Remove(manifests, DiskFileName(retired.file_));
-    Sync(manifests);
+    Remove(manifests.Get(), DiskFileName(retired.file_));
+    Sync(manifests.Get());
     for (const auto& c : retired.manifest_.components) {
       for (const auto& p : c.chunks)
-        if (!Referenced(chunks, p.file))
-          Remove(chunks, DiskFileName(p.file));
+        if (!Referenced(chunks.Get(), p.file))
+          Remove(chunks.Get(), DiskFileName(p.file));
       for (auto p : {c.tail, c.private_state})
-        if (p && !Referenced(private_files, p->file))
-          Remove(private_files, DiskFileName(p->file));
+        if (p && !Referenced(private_files.Get(), p->file))
+          Remove(private_files.Get(), DiskFileName(p->file));
     }
-    Sync(chunks);
-    Sync(private_files);
+    Sync(chunks.Get());
+    Sync(private_files.Get());
     return DiskRetireResult::kRetired;
   } catch (...) {
     // Both checkpoint identities and freed payload capacity remain uncertain

@@ -2,6 +2,13 @@
 
 #if defined(ENGINE_ENABLE_HIP)
 
+#include <fcntl.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -9,8 +16,8 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
 #include <ctime>
+#include <cstring>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -21,8 +28,9 @@
 #include <utility>
 #include <vector>
 
-#include "src/core/platform/os_info.hpp"
-#include "src/core/platform/pages.hpp"
+#ifndef MFD_CLOEXEC
+#define MFD_CLOEXEC 0x0001U
+#endif
 
 #ifndef GUFO_REVISION
 #define GUFO_REVISION "unknown"
@@ -45,10 +53,20 @@ enum class AllocationKind {
   kHipMallocAsync,
 };
 
-using FaultSnapshot = platform::PageFaults;
+struct FaultSnapshot {
+  std::uint64_t minor{0};
+  std::uint64_t major{0};
+};
 
 FaultSnapshot ReadFaults() {
-  return platform::ReadPageFaults();
+  rusage usage{};
+  if (getrusage(RUSAGE_SELF, &usage) != 0) {
+    return {};
+  }
+  return {
+      .minor = static_cast<std::uint64_t>(usage.ru_minflt),
+      .major = static_cast<std::uint64_t>(usage.ru_majflt),
+  };
 }
 
 AllocationFaultDelta FaultDelta(FaultSnapshot before, FaultSnapshot after) {
@@ -76,14 +94,12 @@ std::uint64_t ReadMeminfoValue(std::string_view requested_key) {
 }
 
 std::uint64_t AvailableMemoryBytes() {
-  if (const auto meminfo = ReadMeminfoValue("MemAvailable:"); meminfo != 0) {
-    return meminfo;
-  }
-  return platform::AvailableMemoryBytes();
+  return ReadMeminfoValue("MemAvailable:");
 }
 
 std::uint64_t PageSizeBytes() {
-  return platform::PageSizeBytes();
+  const long page_size = sysconf(_SC_PAGESIZE);
+  return page_size > 0 ? static_cast<std::uint64_t>(page_size) : 0;
 }
 
 std::string HipReason(hipError_t status) {
@@ -236,13 +252,21 @@ public:
     if (host_registered_ && host_ != nullptr) {
       (void)hipHostUnregister(host_);
     }
-    platform::ReleaseSharedTempMapping(shared_mapping_);
+    if (mapping_ != nullptr && mapping_size_ != 0) {
+      (void)munmap(mapping_, mapping_size_);
+    }
+    if (fd_ >= 0) {
+      (void)close(fd_);
+    }
     if (stream_ != nullptr) {
       (void)hipStreamDestroy(stream_);
     }
     host_ = nullptr;
     device_ = nullptr;
     allocation_ = nullptr;
+    mapping_ = nullptr;
+    mapping_size_ = 0;
+    fd_ = -1;
     stream_ = nullptr;
     owns_device_ = false;
     hip_host_allocation_ = false;
@@ -253,7 +277,9 @@ public:
   void* host_{nullptr};
   void* device_{nullptr};
   void* allocation_{nullptr};
-  platform::SharedTempMapping shared_mapping_{};
+  void* mapping_{nullptr};
+  std::size_t mapping_size_{0};
+  int fd_{-1};
   hipStream_t stream_{nullptr};
   bool cpu_accessible_{false};
   bool owns_device_{false};
@@ -302,7 +328,40 @@ void MeasureCpuCall(AllocationPhaseResult* phase, Function&& function) {
 }
 
 std::string MincoreEvidence(void* pointer, std::size_t size) {
-  return platform::DescribeResidentPages(pointer, size);
+  if (pointer == nullptr || size == 0) {
+    return "mincore unavailable: no host mapping";
+  }
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if (page_size <= 0) {
+    return "mincore unavailable: page size query failed";
+  }
+  const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+  const auto page = static_cast<std::uintptr_t>(page_size);
+  const auto aligned = address & ~(page - 1U);
+  const std::size_t prefix = address - aligned;
+  if (size > std::numeric_limits<std::size_t>::max() - prefix) {
+    return "mincore unavailable: range overflow";
+  }
+  const std::size_t page_count = (prefix + size + page - 1U) / page;
+  constexpr std::size_t kChunkPages = 1ULL << 20U;
+  std::vector<unsigned char> states(
+      std::min(page_count, kChunkPages), 0U);
+  std::size_t resident = 0;
+  std::size_t completed = 0;
+  while (completed < page_count) {
+    const std::size_t pages =
+        std::min(states.size(), page_count - completed);
+    void* chunk = reinterpret_cast<void*>(aligned + completed * page);
+    if (mincore(chunk, pages * page, states.data()) != 0) {
+      return "mincore unavailable for this allocation";
+    }
+    resident += static_cast<std::size_t>(std::count_if(
+        states.begin(), states.begin() + pages,
+        [](unsigned char value) { return (value & 1U) != 0U; }));
+    completed += pages;
+  }
+  return std::to_string(resident) + "/" + std::to_string(page_count) +
+         " pages resident";
 }
 
 std::uint32_t KernelBlocks() {
@@ -474,20 +533,28 @@ bool CreateResource(AllocationKind kind, std::size_t size,
           "HIP exposes only a mapped host alias and no physical GPU residency.";
       const FaultSnapshot before_faults = ReadFaults();
       const auto begin = std::chrono::steady_clock::now();
-      resource->shared_mapping_ = platform::CreateSharedTempMapping(size);
+      resource->fd_ = static_cast<int>(
+          syscall(SYS_memfd_create, "gufo-allocation-benchmark", MFD_CLOEXEC));
+      if (resource->fd_ >= 0 &&
+          ftruncate(resource->fd_, static_cast<off_t>(size)) == 0) {
+        resource->mapping_ =
+            mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                 resource->fd_, 0);
+        if (resource->mapping_ == MAP_FAILED) {
+          resource->mapping_ = nullptr;
+        }
+      }
       const auto end = std::chrono::steady_clock::now();
       allocation.raw_repetitions.push_back(
           std::chrono::duration<double, std::milli>(end - begin).count());
       allocation.faults = FaultDelta(before_faults, ReadFaults());
-      if (resource->shared_mapping_.data == nullptr) {
+      if (resource->fd_ < 0 || resource->mapping_ == nullptr) {
         allocation.status = "unavailable";
-        allocation.reason =
-            resource->shared_mapping_.unavailable_reason.empty()
-                ? "memfd_create/ftruncate/mmap failed"
-                : resource->shared_mapping_.unavailable_reason;
+        allocation.reason = "memfd_create/ftruncate/mmap failed";
         status = hipErrorOutOfMemory;
       } else {
-        resource->host_ = resource->shared_mapping_.data;
+        resource->host_ = resource->mapping_;
+        resource->mapping_size_ = size;
         resource->cpu_accessible_ = true;
       }
       ComputeAllocationPhaseStatistics(&allocation);
@@ -1036,7 +1103,7 @@ std::string CurrentIso8601Utc() {
   const auto now = std::chrono::system_clock::now();
   const auto time = std::chrono::system_clock::to_time_t(now);
   std::tm utc{};
-  (void)platform::UtcTime(time, &utc);
+  gmtime_r(&time, &utc);
   std::ostringstream output;
   output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
   return output.str();

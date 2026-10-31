@@ -15,7 +15,6 @@
 #include <vector>
 
 #include "src/core/model_config.hpp"
-#include "src/core/platform/mapped_file.hpp"
 
 namespace gufo::core {
 
@@ -145,11 +144,8 @@ struct GgufTensorInfo {
 struct GgufMappedRegion {
   const void* data{nullptr};
   std::size_t size{0};
-  /// Borrowed platform handle of the mapping, valid for the reader lifetime;
-  /// invalid for memory images. Weight-upload readers duplicate or reopen it
-  /// instead of resolving `source_path` again.
-  platform::PlatformFile file_descriptor{platform::kInvalidFile};
-  std::filesystem::path source_path{};
+  /// Borrowed descriptor, valid for the reader lifetime; -1 for memory images.
+  int file_descriptor{-1};
 };
 
 /// Zero-copy, lightweight GGUF binary reader and tensor indexer.
@@ -241,9 +237,10 @@ private:
   bool ParseHeaders(std::string* error_msg);
 
   const std::uint8_t* data_{nullptr};
+  void* mmap_addr_{nullptr};
   std::size_t size_{0};
-  std::filesystem::path source_path_;
-  platform::ReadOnlyMappedFile mapping_;
+  int fd_{-1};
+  bool owns_mmap_{false};
 
   std::uint32_t version_{0};
   std::uint64_t alignment_{32};

@@ -131,7 +131,6 @@ public:
   void ConfigureVision(std::shared_ptr<const qwen::vision::Prompt> prompt,
                        std::shared_ptr<qwen::vision::Encoder> encoder,
                        hipStream_t stream);
-  void PrepareVision(hipStream_t stream);
   void RestoreVisionLayout(const qwen::vision::RopeLayout& layout,
                            hipStream_t stream);
   [[nodiscard]] const qwen::vision::RopeLayout& VisionLayout() const noexcept {
@@ -323,11 +322,9 @@ public:
   /// when only the draft state is needed.
   struct MtpOutput {
     std::int32_t* token{nullptr};
-    /// With `token`: the draft head's softmax probability of it.
-    float* confidence{nullptr};
     MtpCandidateLogits* candidates{nullptr};
     MtpTrace* trace{nullptr};  ///< final-row diagnostic; disables graph capture
-    /// Prefill and headless steps need only persistent KV. A full forward with
+    /// Prefill needs only persistent KV. A subsequent full forward with
     /// known trunk hidden rows is required before heads/recursive proposals.
     bool kv_only{false};
     /// Draft through the small head (the output() prefix plus the
@@ -342,7 +339,6 @@ public:
     Session* session;
     std::span<const std::int32_t> tokens;
     std::int32_t hidden_row;
-    bool kv_only{false};
   };
   /// Copies output() rows `ids` into the session's draft table from slot
   /// `first` on. Enqueued on stream(); never during graph capture.
@@ -372,14 +368,6 @@ public:
   /// Greedy verification keeps full logit rows on the GPU, including penalties.
   [[nodiscard]] bool GreedyMtpPredictions(
       std::span<ArgmaxCandidate> predictions,
-      const sampling::SamplerState& sampler,
-      std::span<const std::int32_t> drafts, std::string* error_msg) const;
-  [[nodiscard]] static bool CanCompactMtpVerification(
-      const sampling::SamplerState& sampler);
-  /// Candidate spans remain valid until this executor next verifies a
-  /// request. One transfer serves all rows; no full CPU rows are reconstructed.
-  [[nodiscard]] bool SampledMtpCandidates(
-      std::span<std::span<const sampling::LogitCandidate>> rows,
       const sampling::SamplerState& sampler,
       std::span<const std::int32_t> drafts, std::string* error_msg) const;
 
@@ -543,8 +531,6 @@ private:
                  bool last_only = false, bool projections_ready = false,
                  bool project_output = true,
                  std::uint32_t checkpoint_tokens = 0) const;
-  /// Orders the main stream after the work queued on side_stream_.
-  bool JoinSide(std::string* error_msg) const;
   bool Moe(const DeviceLayer& l, const float* x, float* out,
            std::uint32_t n_tokens, std::string* error_msg,
            bool last_only = false) const;
@@ -599,13 +585,7 @@ private:
   mutable std::once_flag snapshot_allocator_once_;
   mutable std::shared_ptr<SnapshotAllocator> snapshot_allocator_;
   mutable std::shared_ptr<void> checkpoint_storage_;
-  /// The stream kernels are queued on. Overlapped work swaps in side_stream_
-  /// for its launches and joins back through side_done_ (JoinSide).
-  mutable hipStream_t stream_{nullptr};
-  hipStream_t side_stream_{nullptr};
-  hipEvent_t side_start_{nullptr};
-  hipEvent_t side_done_{nullptr};
-  mutable bool side_pending_{false};  ///< side_done_ not yet waited on
+  hipStream_t stream_{nullptr};
   hipEvent_t counts_ready_{nullptr};
   hipblasHandle_t blas_{nullptr};
   std::unique_ptr<BlasLt> blaslt_;
@@ -715,12 +695,6 @@ private:
   /// Shared transient storage, grown only for penalty-aware verification.
   mutable sampling::TokenPenalty* verification_penalties_{nullptr};
   mutable std::size_t verification_penalty_capacity_{0};
-  static constexpr std::size_t kCompactPenaltyLimit = 4096;
-  std::uint32_t* verification_ids_{nullptr};
-  std::uint32_t* verification_scratch_ids_{nullptr};
-  sampling::LogitCandidate* verification_candidates_{nullptr};
-  sampling::LogitCandidate* verification_candidates_host_{nullptr};
-  mutable std::vector<sampling::TokenPenalty> verification_penalty_host_;
   /// Allocated only when concurrent decoding is first requested.
   mutable float* batch_logits_{nullptr};
   mutable Session::Control* batch_controls_{nullptr};

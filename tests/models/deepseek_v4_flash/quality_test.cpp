@@ -25,7 +25,7 @@ void ScoreOfficialReference(
     const std::string& output_path);
 void DumpReferenceFrontiers(
     const std::shared_ptr<models::deepseek_v4_flash::Model>& model,
-    const std::string& output_directory, bool prefill_only, bool narrow);
+    const std::string& output_directory, bool prefill_only);
 }  // namespace gufo::testing::ds4
 
 namespace {
@@ -1417,29 +1417,17 @@ int main(int argc, char** argv) try {
   const bool template_only =
       argc == 2 && std::string_view(argv[1]) == "--template-only";
   const bool official = argc == 3 && std::string_view(argv[1]) == "--official";
-  const bool frontiers =
-      argc >= 3 && std::string_view(argv[1]) == "--reference-frontiers";
-  bool prefill_only = false, narrow = false;
-  if (frontiers) {
-    for (int i = 3; i < argc; ++i) {
-      const std::string_view option(argv[i]);
-      if (option == "--prefill-only" && !prefill_only)
-        prefill_only = true;
-      else if (option == "--narrow" && !narrow)
-        narrow = true;
-      else {
-        std::cerr << "unknown or repeated frontier option: " << option << '\n';
-        return 2;
-      }
-    }
-  }
+  const bool prefill_only =
+      argc == 4 && std::string_view(argv[3]) == "--prefill-only";
+  const bool frontiers = (argc == 3 || prefill_only) &&
+                         std::string_view(argv[1]) == "--reference-frontiers";
   if (argc > 1 && !dspark && !wide_prefill && !official && !frontiers &&
       !template_only) {
     std::cerr << "usage: ds4_quality_test "
                  "[--template-only|--dspark|--dspark-replay|--indexer-boundary|"
                  "--wide-prefill|--"
                  "official OUT.json|"
-                 "--reference-frontiers OUT-DIR [--prefill-only] [--narrow]]\n";
+                 "--reference-frontiers OUT-DIR [--prefill-only]]\n";
     return 2;
   }
   const char* dspark_model_path =
@@ -1466,8 +1454,7 @@ int main(int argc, char** argv) try {
     return 0;
   }
   if (frontiers) {
-    gufo::testing::ds4::DumpReferenceFrontiers(model, argv[2], prefill_only,
-                                               narrow);
+    gufo::testing::ds4::DumpReferenceFrontiers(model, argv[2], prefill_only);
     return 0;
   }
   if (wide_prefill) {

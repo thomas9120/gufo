@@ -13,15 +13,6 @@
 namespace gufo::models::qwen38_flash_next {
 
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
-/// A chain ends after its first proposal below its gate: the head's
-/// probability of a greedy draft, or the proposal probability q of a sampled
-/// one.
-inline constexpr float kMtpGateProbability = 0.85F;
-inline constexpr float kMtpSampledGateProbability = 0.95F;
-/// In a jointly planned greedy batch a final proposal below this
-/// probability is not verified: its row costs a C8 cycle more than the
-/// expected accepted token returns.
-inline constexpr float kMtpBatchDropProbability = 0.6F;
 
 /// The occupancy an unplanned draft cycle is priced at, or 0 for the
 /// configured session count. Greedy output does not depend on the width, and
@@ -60,21 +51,14 @@ public:
   // one; 0 keeps the configured value (MtpPolicyConcurrency).
   [[nodiscard]] std::uint32_t Choose(
       std::uint32_t budget, std::uint32_t context = 0,
-      std::uint32_t concurrency = 0,
-      bool sampled_subset = false) const noexcept {
+      std::uint32_t concurrency = 0) const noexcept {
     const auto cap = std::min(budget, limit_);
     if (cap == 0 || state_.retry_tokens != 0) {
       return 0;
     }
-    // Keep the first cycle's conservative width until acceptance is observed.
-    // The smaller head's steady-state curve otherwise widens short replies
-    // from the prior alone, paying for a new verifier shape before it can help.
-    sampled_subset = sampled_subset && state_.explored_depth != 0;
     // After a bounded AR interval, try one proposal to detect recovery.
-    return std::min(
-        cap,
-        std::max({1U, BestLength(cap, context, concurrency, sampled_subset),
-                  state_.probe_depth}));
+    return std::min(cap, std::max({1U, BestLength(cap, context, concurrency),
+                                   state_.probe_depth}));
   }
 
   [[nodiscard]] float ExpectedTokens(std::uint32_t drafts) const noexcept {
@@ -87,8 +71,8 @@ public:
   }
 
   void Observe(std::size_t accepted, std::size_t drafted,
-               std::uint32_t context = 0, std::uint32_t concurrency = 0,
-               bool sampled_subset = false) noexcept {
+               std::uint32_t context = 0,
+               std::uint32_t concurrency = 0) noexcept {
     if (drafted == 0)
       return;
     drafted = std::min<std::size_t>(drafted, limit_);
@@ -115,7 +99,7 @@ public:
         std::max<std::uint32_t>(state_.explored_depth, observed);
     if (accepted < drafted)
       state_.failed_depths |= 1U << accepted;
-    if (BestLength(limit_, context, concurrency, sampled_subset) == 0)
+    if (BestLength(limit_, context, concurrency) == 0)
       state_.retry_tokens = 16;
   }
 
@@ -161,12 +145,11 @@ private:
                : state_.successes[depth] /
                      (state_.successes[depth] + state_.failures[depth]);
   }
-  [[nodiscard]] std::uint32_t BestLength(std::uint32_t cap,
-                                         std::uint32_t context,
-                                         std::uint32_t concurrency,
-                                         bool sampled_subset) const noexcept {
-    const auto costs = MtpCycleCosts(
-        context, concurrency == 0 ? concurrency_ : concurrency, sampled_subset);
+  [[nodiscard]] std::uint32_t BestLength(
+      std::uint32_t cap, std::uint32_t context,
+      std::uint32_t concurrency) const noexcept {
+    const auto costs =
+        MtpCycleCosts(context, concurrency == 0 ? concurrency_ : concurrency);
     float survival = 1.0F;
     float expected_tokens = 1.0F;  // The sampled target anchor.
     float best_score = 1.0F;       // Ordinary target decoding.

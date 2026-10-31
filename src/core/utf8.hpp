@@ -13,14 +13,6 @@ namespace gufo::core {
 class Utf8Decoder {
 public:
   std::string Push(std::string_view bytes, bool final = false) {
-    return Push(bytes, final, [](std::size_t, std::size_t) {});
-  }
-
-  // Report each decoded scalar's consumed input bytes and produced UTF-8
-  // bytes. Consumers can preserve token provenance across byte fallback and
-  // malformed sequences without implementing a second UTF-8 decoder.
-  template<typename Observe>
-  std::string Push(std::string_view bytes, bool final, Observe observe) {
     pending_.append(bytes);
     std::string output;
     output.reserve(pending_.size());
@@ -29,7 +21,6 @@ public:
       const auto lead = static_cast<unsigned char>(pending_[offset]);
       if (lead < 0x80) {
         output.push_back(pending_[offset++]);
-        observe(1, 1);
         continue;
       }
       const unsigned length = lead >= 0xC2 && lead <= 0xDF   ? 2
@@ -39,7 +30,6 @@ public:
       if (length == 0) {
         output.append("\xEF\xBF\xBD");
         ++offset;
-        observe(1, 3);
         continue;
       }
       unsigned prefix = 1;
@@ -55,13 +45,11 @@ public:
       if (prefix == length) {
         output.append(pending_, offset, length);
         offset += length;
-        observe(length, length);
       } else if (offset + prefix == pending_.size() && !final) {
         break;
       } else {
         output.append("\xEF\xBF\xBD");
         offset += prefix;
-        observe(prefix, 3);
       }
     }
     pending_.erase(0, offset);

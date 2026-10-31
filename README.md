@@ -1,52 +1,77 @@
-# Gufo: The ***Open Source*** Strix Halo AI engine 
+# Gufo for Windows: the open source Strix Halo inference engine
 
 <p align="center">
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>
 
-Gufo is a vertical local inference engine for Linux and Windows, specifically built and optimized for AMD Strix Halo hardware:
-Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unified memory.
+Gufo is a vertical local inference engine specifically built and optimized for the AMD Strix Halo hardware:
+Ryzen AI MAX+ 395 systems with Radeon 8060S (`gfx1151`), up to 128 GiB of unified memory. This fork is specifically for adding Windows support for Gufo.
+I intend to keep this fork up to date as best I can with the official Gufo repository.
 
-**Contributions are welcome!**
+Models tested and confirmed fully functional on this fork:
 
-See the [changelog](CHANGELOG.md) and [GitHub Releases](https://github.com/gufo-org/gufo/releases)
-for user-facing changes and release history.
+- Unsloth Qwen3.8-27B-UD-Q4_K_XL
+- Unsloth Qwen3.8-Flash-Next-UD-IQ4_XS
+- Unsloth Qwen3.8-Flash-Next-UD-Q4_K_XL
 
-> [!TIP]
-> Check out **[Gufo RDMA for Dual Strix Halo](https://github.com/neuhaus/gufo)**, a Gufo variant that has not been merged yet!
 
-## Models and benchmarks
+Special thanks to pixmaate for creating the initial windows port https://github.com/pixmaate/gufo
+and to the original Gufo team https://github.com/gufo-org/gufo
+
+English with optional Simplified Chinese language support by @jerrydong1988
+
 
 All model documentation lives under [docs/models](docs/models/README.md):
 
-| Model | Inference modes | Hugging Face weights | Benchmarks | Quality |
-| --- | --- | --- | --- | --- |
-| [Qwen3.8 27B](docs/models/qwen3.8-27b/README.md) | Q4/Q8, images, AR, DFlash2 | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q4_K_XL.gguf) / [Q8_K_XL](https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/blob/4ca720788d1e01f1bff70c033e0d0028fd02e502/Qwen3.8-27B-UD-Q8_K_XL.gguf) · [DFlash2 Q4_K_M](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/blob/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q4_K_M.gguf) | Q4: **648.89 tok/s pp**; up to **71.55 tok/s tg** single user and **128.42 aggregated tok/s** on 8 concurrent requests with DFlash2 · [Benchmarks](docs/models/qwen3.8-27b/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-27b/QUALITY.md) |
-| [Qwen3.8 Flash-Next](docs/models/qwen3.8-flash-next/README.md) | Q4, images, AR, MTP | Unsloth [Q4_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/38bb39ee97821de2c9009abb7e93950eec396e66/UD-Q4_K_XL) · [MTP Q8_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf) | **1,801.01 tok/s pp** (AR); up to **116.93 tok/s tg** single user and **245.81 aggregated tok/s** on 8 concurrent requests with MTP · [Benchmarks](docs/models/qwen3.8-flash-next/BENCHMARKS.md) | [Quality](docs/models/qwen3.8-flash-next/QUALITY.md) |
-| [DeepSeek V4 Flash](docs/models/deepseek-v4-flash/README.md) | AR, DSpark | [antirez Flash 0731 IQ2XXS](https://huggingface.co/antirez/deepseek-v4-gguf/blob/1cd7b564460821938add0475a60b942c409295e0/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf) · [DSpark](https://huggingface.co/antirez/deepseek-v4-gguf/blob/e7f04037032990db0346398d249baf9fb9df1ccc/DeepSeek-V4-Flash-DSpark-support-0731.gguf) | **484.62 tok/s pp**; up to **26.62 tok/s tg** single user and **54.74 aggregated tok/s** on 8 concurrent requests with DSpark · [Benchmarks](docs/models/deepseek-v4-flash/BENCHMARKS.md) | [Quality](docs/models/deepseek-v4-flash/QUALITY.md) |
-| [Qwen3-ASR 1.7B](docs/models/qwen3-asr/README.md) | Speech recognition | [BF16](https://huggingface.co/Qwen/Qwen3-ASR-1.7B/tree/7278e1e70fe206f11671096ffdd38061171dd6e5) | **15.27× realtime** · [Benchmarks](docs/models/qwen3-asr/BENCHMARKS.md) | [Quality](docs/models/qwen3-asr/QUALITY.md) |
-| [EmbeddingGemma 2](docs/models/embeddinggemma-2/README.md) | Text and image embeddings | [BF16](https://huggingface.co/google/embeddinggemma-2/tree/914f7f89142e33e77833254d9c9b90c3cef7303b) | Up to **41.5k tokens/s** over HTTP; **13.0 ms** for a 404-token request · [Benchmarks](docs/models/embeddinggemma-2/BENCHMARKS.md) | [Quality](docs/models/embeddinggemma-2/QUALITY.md) |
-| [Qwen3-TTS 1.7B](docs/models/qwen3-tts/README.md) | Speech synthesis and voice cloning | BF16 [CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) / [VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) / [Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | Up to **2.54× realtime**; **201 ms** to first audio (CustomVoice) · [Benchmarks](docs/models/qwen3-tts/BENCHMARKS.md) | [Quality](docs/models/qwen3-tts/QUALITY.md) |
-| [Qwen-Image-2.1](docs/models/qwen-image-2.1/README.md) | BF16 image generation and editing | [Complete pipeline](https://huggingface.co/Qwen/Qwen-Image-2.1/tree/b3179ad355be050328e483a9dfdd9e60cd62adfa) | In progress · [Benchmarks](docs/models/qwen-image-2.1/BENCHMARKS.md) | [Quality](docs/models/qwen-image-2.1/QUALITY.md) |
-| [MiniMax H3](docs/models/minimax-h3/README.md) | BF16 text to video/audio | [FL2VA pipeline](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/FL2VA) | In progress · [Benchmarks](docs/models/minimax-h3/BENCHMARKS.md) | [Quality](docs/models/minimax-h3/QUALITY.md) |
 
-Peak measured workloads; text pp is autoregressive (AR), while tg uses the
-named speculative mode. Peaks include repetitive output; aggregate tg sums
-individual request decode rates. Qwen27B's single-user peak uses the short-prompt
-C1 workload. Audio excludes loading.
-Each model guide lists the required files and complete benchmark settings.
+## Windows quickstart
 
-## Philosophy
+Run Qwen3.8-Flash-Next natively on **Windows 11, Strix Halo / gfx1151, 128 GB RAM**.
+Install the AMD graphics driver. For Flash-Next at 256K context, set **96 GB
+dedicated GPU memory** in AMD Software → Performance → Tuning → Variable
+Graphics Memory. Setup checks the computer but does not change these settings.
 
-- Contributions are welcome! We need the help of Strix Halo community to keep improving gufo!
-- We would like this to be the one-stop shop for Strix Halo Local AI enthusiasts: batteries included for text, audio, image, and video models.
-- Build and optimize specifically for the Strix Halo 128 GiB hardware. Smaller memory configurations should still work and preserve the speed benefits for models that can fit on memory.
-- Support only the best available models for their size that can run on this hardware: less code to maintain, more focused optimization and testing work.
-- Preserve quality when optimizing. Each model's quality report records independent numerical checks, execution consistency and unresolved gaps. Don't reuse kernels across different models to limit blast radius of a code change.
-- Treat concurrent requests, cancellation and conversation caching as first-class workloads.
-- Keep production dependencies small and development tools separate.
+1. Download **[Gufo-Setup.cmd](https://github.com/thomas9120/gufo-windows/releases/latest/download/Gufo-Setup.cmd)**
+   from the latest release and double-click it. If Windows SmartScreen warns
+   about the unsigned launcher, choose **More info**, then **Run anyway**.
 
-## Quickstart
+2. Choose **Install Gufo** in the installer. It clones `windows-main` into
+   `%USERPROFILE%\Gufo`, shows the setup plan from `tools\windows\setup.ps1`,
+   installs missing prerequisites, builds Gufo, verifies GPU startup, and creates
+   the **Gufo** desktop shortcut plus a **Gufo Setup** Start Menu entry. Allow the
+   installers to finish; the first setup needs substantial downloads, disk space,
+   and compilation time. Interrupting is safe: completed downloads and build
+   steps are reused when you run it again.
+
+   The installer keeps the same options as the source setup and adds
+   **Advanced** (folder, build jobs, custom GPU/vcpkg paths) plus **Update**,
+   **Repair**, and **Uninstall** for an existing install. Logs are written to
+   `%LOCALAPPDATA%\Gufo\logs`.
+
+3. Double-click the **Gufo** desktop shortcut, or **Launch launcher** in the
+   installer. In the GUI, choose your model and optional MTP/projector files,
+   adjust settings, click **Save**, then **Start**. For Flash-Next vision, use
+   the compatible **BF16** projector. See [model download instructions](docs/models/qwen3.8-flash-next/README.md#load-and-run)
+   if you do not already have the files. Connect your chat client to
+   **`http://127.0.0.1:8080/v1`** with the model name shown in the GUI (`gufo` by default).
+
+The [GUI](tools/gui/README.md) opens at `http://127.0.0.1:8090`; opening it does
+not load a model. Use **Stop** to unload Gufo or **Exit** to close both processes.
+
+To update an install, open **Gufo Setup** from the Start Menu and choose
+**Update** (it fast-forwards `windows-main` and rebuilds
+`build\windows-gpu\gufo.exe`), or run
+**[update-windows.bat](update-windows.bat)** in the install folder. Commit,
+stash, or move local changes and untracked files before updating.
+
+For a manual source build instead, install
+[Git for Windows](https://git-scm.com/downloads/win), clone
+`https://github.com/thomas9120/gufo-windows.git` on branch `windows-main`, and run
+**[setup-windows.bat](setup-windows.bat)**. See
+[guided setup details](docs/WINDOWS.md#windows-installer) for installer flags,
+logs, preview mode, and custom dependency paths.
+
+## Linux quickstart
 
 ```sh
 hf download unsloth/Qwen3.8-27B-GGUF \
@@ -113,35 +138,25 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-For Open WebUI, VS Code, OpenAI SDK and Responses-API clients (for example
-Codex), set the API base URL to `http://localhost:8080/v1`. Chat Completions and
-Responses support text, images, function tools, structured output and streaming.
-See the [API contract](docs/SERVER.md).
+For Open WebUI, VS Code and OpenAI SDK clients, set the API base URL to
+`http://localhost:8080/v1`. Chat Completions supports text, images, tools and
+streaming; Responses supports text and streaming. See the [API contract](docs/SERVER.md).
 
 The text server uses the model's native context by default and generates until
 EOS or the context is full. `--context N` sets context capacity per session;
 `--max-tokens N` sets a default response limit that clients can override.
 Reasoning tokens count toward that response limit.
 
-## Harness notes
-
-- **Qwen with Codex:** Codex sends developer messages mid-conversation, after
-  compaction or a settings change. Qwen's template accepts only one leading
-  system turn, so Gufo moves them there. The request that introduces one is
-  prefilled again; later requests reuse the cache. See the
-  [API contract](docs/SERVER.md).
-- **Qwen with Claude Code:** not supported. Claude Code adds a system message
-  to `messages` on every turn, so Gufo moves a new one to the leading system
-  turn each time and every request prefills the whole history again (#522).
-
 ## Build from source
 
-Production packages target Linux x86-64 on AMD Strix Halo (`gfx1151`).
-Windows x86-64 is a supported native build target for development; see
-[BUILD-WINDOWS.md](BUILD-WINDOWS.md). CMake owns
+Linux x86-64 on AMD Strix Halo (`gfx1151`) is the supported target. CMake owns
 one production configuration for both Nix and ordinary Linux builds. Tests,
 profilers, tuning executables and Python reference runners are not installed
 with the production package. No `build.sh` wrapper is needed.
+
+Windows 11 x64 builds natively against AMD's TheRock ROCm; see
+[Windows](docs/WINDOWS.md) for the toolchain, a prerequisite check and the
+build script.
 
 ### With Nix
 
@@ -159,46 +174,19 @@ requirements. Optional benchmark baselines are selected separately with
 See [testing](docs/TESTING.md) for the small hosted CI suite and
 explicit local quality checks.
 
-Prebuilt store paths are published to the `gufo` Cachix cache. The flake
-declares it in `nixConfig`: users listed in `trusted-users` are asked to accept
-it, or pass `--accept-flake-config`. Nix ignores it for other users; add it
-system-wide with `cachix use gufo` or in `/etc/nix/nix.conf`:
-
-```
-extra-substituters = https://gufo.cachix.org
-extra-trusted-public-keys = gufo.cachix.org-1:rfZe3n4lHINgyoACKzs5EthIZmBNvEyCCtufUpth0PE=
-```
-
-The Nix package and development shell use ROCm 10.1.0 (HIP Clang 24)
-from the pinned [nixpkgs ROCm 10.1 update](https://github.com/NixOS/nixpkgs/pull/573885).
-Python, Python packages and general build dependencies come from the pinned
-`nixos-unstable` input. The ROCm package set comes from the separate fork,
-retaining its compiler/runtime dependencies to reuse the gfx1151 binaries on
-`gufo.cachix.org`. All Nix workflows configure this cache explicitly.
-Both include a [queue-memory patch](.devops/nix/patches/rocr-fixed-cwsr-rocm10.patch)
-for Strix Halo. It keeps queue save/restore buffers, launch/copy arenas and
-code-loading staging resident during host memory compaction, while retaining
-managed-memory support and the ordinary fine-grained host-allocation policy.
-
 ### Without Nix
 
 Install a C++20 compiler, CMake 3.21+, Ninja, pkg-config and the
-following development libraries. The pinned Nix toolchain uses GCC
-16.2 and ROCm 10.1.0 (HIP Clang 24). Attention and audio convolution kernels are compiled
+following development libraries. The currently qualified toolchain is GCC
+15.3 and ROCm 7.2.3. Attention and audio convolution kernels are compiled
 directly from HIP. Python, Triton/AOTriton, Composable Kernel and MIOpen are
 not production build or runtime requirements.
-For the same protection against queue evictions as the Nix build, apply the
-ROCr patch above when building your runtime. Flash-Next's host buffers also use
-Linux long-term pins, with ordinary HIP registration retained when system
-limits disallow those pins. Gufo leaves `HSA_USERPTR_FOR_PAGED_MEM` unchanged.
 
 | Dependency | Used for |
 | --- | --- |
 | ROCm HIP compiler/runtime, hipBLAS, hipBLASLt, rocBLAS | GPU execution and matrix multiplication |
 | hipCUB, rocPRIM, rocWMMA headers | Compiled GPU kernels |
 | ICU, libcurl, OpenSSL, libpng, libjpeg, libwebp | Tokenization, HTTPS, hashing and images |
-| FFmpeg development libraries | Video embedding decoding and RGB conversion |
-| libsndfile, libsoxr | Audio decoding and reference-compatible resampling |
 | FFmpeg and ffprobe | Video/audio output; invoked as separate executables |
 
 Install ROCm using [AMD's Linux instructions](https://rocm.docs.amd.com/projects/install-on-linux/en/latest/).
@@ -209,7 +197,7 @@ For example, on Debian/Ubuntu the ordinary system libraries are:
 
 ```sh
 sudo apt install build-essential cmake ninja-build pkg-config \
-  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev libsndfile1-dev libsoxr-dev libavformat-dev libavcodec-dev libavutil-dev libswscale-dev ffmpeg
+  libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev libwebp-dev ffmpeg
 
 # ROCm libraries from the table, named as AMD's repository ships them.
 sudo apt install hipblas-dev hipblaslt-dev rocblas-dev \

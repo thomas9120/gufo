@@ -13,10 +13,6 @@
 
 #include "src/models/qwen/tokenizer.hpp"
 
-namespace gufo::sampling {
-class SamplerState;
-}
-
 namespace gufo::speculative {
 
 /// Represents a speculative draft proposal block
@@ -26,7 +22,6 @@ struct DraftProposal {
   std::vector<float> candidate_probabilities;
   std::size_t candidates_per_token{0};
   std::uint32_t start_pos{0};
-  bool from_lookup{false};
 };
 
 struct DraftTargetContext {
@@ -47,7 +42,6 @@ struct DraftProposalRequest {
   std::uint32_t max_tokens{0};
   float temperature{0.0F};
   std::uint64_t* rng_state{nullptr};
-  const sampling::SamplerState* sampler{nullptr};
 };
 
 class IDraftBackendSnapshot {
@@ -115,17 +109,6 @@ public:
     return false;
   }
 
-  /// Numeric target sampling controls can guide q without constraining p.
-  /// Backends that do not use them retain their original proposal path.
-  [[nodiscard]] virtual DraftProposal ProposeForRequest(
-      const DraftProposalRequest& request) {
-    return request.temperature > 0.0F
-               ? ProposeSampled(request.tokens, request.position,
-                                request.max_tokens, request.temperature,
-                                request.rng_state)
-               : Propose(request.tokens, request.position, request.max_tokens);
-  }
-
   /// Providers can share projections while retaining separate request state.
   /// The default preserves the ordinary per-request proposal operations.
   [[nodiscard]] virtual std::vector<DraftProposal> ProposeBatch(
@@ -141,7 +124,13 @@ public:
     std::vector<DraftProposal> proposals;
     proposals.reserve(requests.size());
     for (const auto& request : requests) {
-      proposals.push_back(request.backend->ProposeForRequest(request));
+      proposals.push_back(
+          request.temperature > 0.0F
+              ? request.backend->ProposeSampled(
+                    request.tokens, request.position, request.max_tokens,
+                    request.temperature, request.rng_state)
+              : request.backend->Propose(request.tokens, request.position,
+                                         request.max_tokens));
     }
     return proposals;
   }

@@ -82,7 +82,7 @@ test-results/
 # source control. Keep the root anchored so similarly named fixture paths are
 # unaffected.
 /artifacts/
-/models
+/models/
 *.safetensors
 *.gguf
 *.ckpt
@@ -120,3 +120,6 @@ tests/quality/compsec.json
 
 # Claude Code local settings
 .claude/settings.local.json
+
+# Host-specific Windows tool paths (see tools/windows/local.example.json)
+tools/windows/local.json

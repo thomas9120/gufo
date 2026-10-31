@@ -11,7 +11,9 @@ namespace cub = hipcub;
 
 #include "detail/ds4_rocm_device.hip.hpp"
 
-// Precise F32 router math for the established ROCm 7.2 path.
+// Precise transcendentals for the MoE router top-k scores, immune to -fapprox-func.
+// These functions are to be used on paths where small error can be translated to
+// some macro effect - like expert selection kernels
 extern "C" __device__ __attribute__((pure))  float __ocml_exp_f32(float);
 extern "C" __device__ __attribute__((pure))  float __ocml_log1p_f32(float);
 extern "C" __device__ __attribute__((const)) float __ocml_sqrt_f32(float);

@@ -12,26 +12,10 @@ namespace gufo::server {
 HttpResponse HandleOpenAiChat(const HttpRequest& request,
                               TextGenerationBackend& backend);
 
-/// Count the same prompt as Chat Completions, without scheduling generation.
-/// Streaming options are accepted but the result is always one JSON response.
-HttpResponse HandleOpenAiChatInputTokens(const HttpRequest& request,
-                                         TextGenerationBackend& backend);
-
-/// Shared Chat/Responses result, including unsupported-backend and prompt
-/// errors.
-HttpResponse CountOpenAiInputTokens(const ChatRequest& chat,
-                                    TextGenerationBackend& backend);
-
-/// llama-server's /apply-template: the prompt a Chat Completions body renders
-/// to, with the server's reasoning defaults applied, without generating.
-/// `model` is optional, as outside llama-server router mode.
-HttpResponse HandleApplyTemplate(const HttpRequest& request,
-                                 TextGenerationBackend& backend);
-
 /// Responses nests output schema under text.format and effort under reasoning.
 /// Shared controls stay validated as in Chat Completions, but the Responses
 /// adapter tolerates standard Responses fields with no native effect (hosted
-/// tool types, reasoning.summary, text.verbosity) rather than reject
+/// tool types, include, reasoning.summary, text.verbosity) rather than reject
 /// the whole request, because conforming Responses clients routinely send them.
 std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
                                                         ChatRequest* chat);
@@ -60,13 +44,12 @@ bool ParseAnthropicToolMessage(const json::Value& item,
                                std::string* error);
 /// Responses text output uses the same reasoning/UTF-8 filter and scheduler
 /// as Chat Completions, including streaming cancellation and cache retention.
-/// `model` is the served name to report; empty reports the primary name.
 HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                   TextGenerationBackend& backend,
                                   const ChatRequest& chat,
                                   std::size_t max_tokens,
                                   const sampling::SamplingConfig& sampling,
-                                  bool stream, std::string_view model = {});
+                                  bool stream);
 /// Messages output through the same path: content blocks when buffered,
 /// Anthropic SSE events when streamed.
 HttpResponse CreateAnthropicMessage(const HttpRequest& request,
@@ -74,7 +57,7 @@ HttpResponse CreateAnthropicMessage(const HttpRequest& request,
                                     const ChatRequest& chat,
                                     std::size_t max_tokens,
                                     const sampling::SamplingConfig& sampling,
-                                    bool stream, std::string_view model = {});
+                                    bool stream);
 
 }  // namespace gufo::server
 

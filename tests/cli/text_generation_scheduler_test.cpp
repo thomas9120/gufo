@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
@@ -30,8 +31,6 @@
 #include "src/cli/serve/stop_sequences.hpp"
 #include "src/cli/serve/trace.hpp"
 #include "src/core/json.hpp"
-#include "src/core/platform/env.hpp"
-#include "src/core/platform/os_info.hpp"
 
 namespace {
 
@@ -403,18 +402,13 @@ public:
   }
 
   [[nodiscard]] TextDecodeSelection SelectNext(
-      TextRunnerState& state,
-      gufo::sampling::SamplerState& sampler) const override {
+      TextRunnerState& state, gufo::sampling::SamplerState&) const override {
     const auto& fake = RequireFakeState(state);
     if (!fake.frontier.has_value()) {
       throw std::logic_error("scheduler fake has no frontier");
     }
-    auto probabilities = sampler.config().logprobs
-                             ? std::optional(gufo::sampling::TokenLogprobs{
-                                   {*fake.frontier, -0.25}, {}})
-                             : std::nullopt;
     if (control_->stop_after && fake.decode_count >= *control_->stop_after)
-      return {.stop = true, .logprobs = probabilities};
+      return {.stop = true};
     if (control_->eos_after && fake.decode_count >= *control_->eos_after &&
         fake.stop_at_eos())
       return {.stop = true};
@@ -423,15 +417,12 @@ public:
           static_cast<std::size_t>(*fake.frontier - fake.label * 100);
       if (index >= control_->output_pieces.size())
         return {.stop = true};
-      return {.token = *fake.frontier,
-              .piece = control_->output_pieces[index],
-              .logprobs = probabilities};
+      return {.token = *fake.frontier, .piece = control_->output_pieces[index]};
     }
     return {
         .stop = false,
         .token = *fake.frontier,
         .piece = std::to_string(*fake.frontier),
-        .logprobs = probabilities,
     };
   }
 
@@ -535,7 +526,6 @@ public:
       auto selection = SelectNext(state, sampler);
       if (selection.stop) {
         step.stop = true;
-        step.terminal_logprobs = selection.logprobs;
         break;
       }
       Advance(state, selection.token);
@@ -944,9 +934,9 @@ void TestGenerationTraceRecordsPromptAndOutput() {
   Expect(control->decode_calls.load(std::memory_order_relaxed) == 0,
          "an unarmed trace decodes no prompt");
 
-  const auto path = fs::temp_directory_path() /
-                    ("gufo-scheduler-trace-" +
-                     std::to_string(gufo::platform::ProcessId()) + ".jsonl");
+  const auto path =
+      fs::temp_directory_path() /
+      ("gufo-scheduler-trace-" + std::to_string(::getpid()) + ".jsonl");
   fs::remove(path);
   Expect(!Trace::Open(path.string()).has_value(), "trace file opens");
   gufo::sampling::SamplingConfig sampling;
@@ -1174,7 +1164,7 @@ void TestBatchDeviceLossFailsSuccessfulPeers() {
 void TestModelOwnedBatchMetrics() {
   for (const std::size_t actual_width : {1U, 2U}) {
     namespace metrics = gufo::server::detail;
-    const auto prompt_before = metrics::TotalPromptTokens().load();
+    const auto prompt_before = metrics::TotalPromptMetrics().Snapshot().tokens;
     const auto generated_before = metrics::TotalGenTokens().load();
     const auto rounds_before = metrics::TotalDraftRounds().load();
     auto control = std::make_shared<FakeControl>();
@@ -1199,10 +1189,11 @@ void TestModelOwnedBatchMetrics() {
       Expect(result.token_metrics_recorded, "scheduled tokens counted live");
       gufo::server::RecordServerMetrics(result);
     }
-    Expect(metrics::TotalPromptTokens().load() - prompt_before == 2 &&
-               metrics::TotalGenTokens().load() - generated_before == 24 &&
-               metrics::TotalDraftRounds().load() - rounds_before == 8,
-           "speculative batches and HTTP completion count each token once");
+    Expect(
+        metrics::TotalPromptMetrics().Snapshot().tokens - prompt_before == 2 &&
+            metrics::TotalGenTokens().load() - generated_before == 24 &&
+            metrics::TotalDraftRounds().load() - rounds_before == 8,
+        "speculative batches and HTTP completion count each token once");
   }
 }
 
@@ -1783,7 +1774,7 @@ void TestServerMetricsAreLive() {
   const auto read = [](const auto& value) {
     return value.load(std::memory_order_relaxed);
   };
-  const auto prompt_before = read(metrics::TotalPromptTokens());
+  const auto prompt_before = metrics::TotalPromptMetrics().Snapshot();
   const auto generated_before = read(metrics::TotalGenTokens());
   const auto processing_before = read(metrics::RequestsProcessing());
   const auto deferred_before = read(metrics::RequestsDeferred());
@@ -1794,8 +1785,13 @@ void TestServerMetricsAreLive() {
 
     auto active = scheduler->Submit({1, 10}, 3, 0.0F);
     control->WaitForAdvance(1);
-    Expect(read(metrics::TotalPromptTokens()) - prompt_before == 2,
+    Expect(metrics::TotalPromptMetrics().Snapshot().tokens -
+                   prompt_before.tokens ==
+               2,
            "prompt tokens are counted when prefill executes");
+    Expect(metrics::TotalPromptMetrics().Snapshot().seconds >
+               prompt_before.seconds,
+           "prefill time is published before generation completes");
     Expect(read(metrics::TotalGenTokens()) - generated_before == 1,
            "generated tokens are counted before the request completes");
     Expect(read(metrics::RequestsProcessing()) - processing_before == 1,
@@ -1814,8 +1810,15 @@ void TestServerMetricsAreLive() {
            "scheduler results identify live token accounting");
     gufo::server::RecordServerMetrics(active_result);
     gufo::server::RecordServerMetrics(queued_result);
-    Expect(read(metrics::TotalPromptTokens()) - prompt_before == 4,
+    Expect(metrics::TotalPromptMetrics().Snapshot().tokens -
+                   prompt_before.tokens ==
+               4,
            "HTTP completion does not count the prompt again");
+    const auto seconds_after = metrics::TotalPromptMetrics().Snapshot().seconds;
+    Expect(std::abs(seconds_after - prompt_before.seconds -
+                    (active_result.prefill_ms + queued_result.prefill_ms) /
+                        1000.0) < 1e-9,
+           "prefill time matches step timers and HTTP does not count it twice");
     Expect(read(metrics::TotalGenTokens()) - generated_before == 4,
            "every generated token is counted once");
   }
@@ -2314,17 +2317,11 @@ void TestStopSequencesPreserveExecutedState() {
         TextGenerationScheduler::RequestMetadata metadata;
         metadata.stop_sequences = {"<STOP>"};
         std::string streamed;
-        gufo::sampling::SamplingConfig config;
-        config.logprobs = 2;
-        std::size_t logprob_tokens = 0;
-        auto request =
-            scheduler->Submit({1, 10}, 8, config, {}, true, metadata);
-        const auto result =
-            request.Wait([&](const gufo::server::TokenPiece& piece) {
-              streamed += piece.text;
-              logprob_tokens += piece.logprobs != nullptr;
-              return true;
-            });
+        auto request = scheduler->Submit({1, 10}, 8, 0.0F, {}, true, metadata);
+        const auto result = request.Wait([&](std::string_view piece) {
+          streamed += piece;
+          return true;
+        });
         Expect(
             result.finish_reason == Finish::kStopSequence && !result.cancelled,
             "stop sequence is a successful completion");
@@ -2335,14 +2332,10 @@ void TestStopSequencesPreserveExecutedState() {
         Expect(result.tokens.size() == (first ? 1U : 2U) &&
                    result.completion_tokens == result.tokens.size(),
                "usage includes the token that completed the stop");
-        Expect(logprob_tokens == result.tokens.size() &&
-                   result.logprobs.size() == result.tokens.size(),
-               "stop filtering retains selected metadata and discards the "
-               "speculative tail");
         // Repeating the prompt must not resume from an incorrectly labelled
         // generated frontier, including when preview or a speculative tail ran.
         const auto replay =
-            scheduler->Submit({1, 10}, 8, config, {}, true, metadata).Wait();
+            scheduler->Submit({1, 10}, 8, 0.0F, {}, true, metadata).Wait();
         Expect(replay.tokens == result.tokens && replay.text == result.text,
                "a stopped request leaves a safe reusable prompt cache");
       }
@@ -2996,90 +2989,11 @@ void TestEmptyTokenIsPublished() {
          "an empty streamed piece still charges the output budget");
 }
 
-void TestTokenLogprobs() {
-  for (const bool multi : {false, true}) {
-    for (const bool preview : {false, true}) {
-      auto control = std::make_shared<FakeControl>();
-      control->multi_token_decode = multi;
-      control->preview_first_token = preview;
-      control->stop_after = 3;
-      auto scheduler = MakeScheduler(control, 2);
-      gufo::sampling::SamplingConfig config;
-      config.logprobs = 2;
-      auto request = scheduler->Submit({1, 10, 11}, 8, config, {}, true);
-      auto peer =
-          scheduler->Submit({2, 20, 21}, 2, gufo::sampling::SamplingConfig{});
-      std::vector<gufo::sampling::TokenId> observed;
-      const auto result =
-          request.Wait([&](const gufo::server::TokenPiece& piece) {
-            Expect(piece.logprobs != nullptr,
-                   "every selected token carries metadata");
-            observed.push_back(piece.logprobs->entries.front().id);
-            return true;
-          });
-      Expect(result.tokens == ExpectedTokens(1, 3) &&
-                 observed == ExpectedTokens(1, 4),
-             "preview and speculative blocks publish each token and EOS "
-             "exactly once");
-      Expect(result.logprobs.size() == observed.size(),
-             "stream and buffered records agree");
-      Expect(peer.Wait().logprobs.empty(),
-             "concurrent disabled requests retain no metadata");
-      const auto resumed = scheduler->Submit({1, 10, 11}, 2, config).Wait();
-      Expect(resumed.logprobs.size() == 2,
-             "a reused session owns fresh logprob state");
-      auto cancelled = scheduler->Submit({3, 30, 31}, 8, config, {}, true);
-      std::size_t delivered = 0;
-      const auto cancelled_result =
-          cancelled.Wait([&](const gufo::server::TokenPiece& piece) {
-            Expect(piece.logprobs != nullptr,
-                   "cancelled stream retains delivered metadata");
-            ++delivered;
-            return false;
-          });
-      Expect(cancelled_result.cancelled && delivered == 1,
-             "cancellation stops metadata delivery with text");
-      const auto after_cancel =
-          scheduler->Submit({4, 40, 41}, 2, config).Wait();
-      Expect(after_cancel.logprobs.size() == 2 &&
-                 after_cancel.logprobs.front().entries.front().id ==
-                     ExpectedTokens(4, 1).front(),
-             "reclaimed sessions do not leak cancelled metadata");
-    }
-  }
-  for (const bool stream : {false, true}) {
-    auto control = std::make_shared<FakeControl>();
-    TextSchedulerPolicy policy;
-    if (stream) {
-      policy.max_buffered_output_bytes_per_request = 32;
-      policy.max_buffered_output_bytes_total = 32;
-    } else {
-      policy.max_output_bytes_per_request = 32;
-    }
-    auto scheduler = MakeScheduler(control, 1, {}, policy);
-    gufo::sampling::SamplingConfig config;
-    config.logprobs = 0;
-    bool failed = false;
-    std::size_t scored = 0;
-    try {
-      scored = scheduler->Submit({1, 10}, 2, config, {}, stream)
-                   .Wait()
-                   .logprobs.size();
-    } catch (const TextGenerationError& error) {
-      failed = error.code() == TextGenerationErrorCode::kOutputBackpressure;
-    }
-    Expect(stream ? failed : scored == 2,
-           stream ? "metadata counts toward backpressure limits"
-                  : "metadata does not count toward the text byte limit");
-  }
-}
-
 int main() {
-  TestTokenLogprobs();
   TestPublicationWaitUsesRecentSubstantialPrefill();
   // Log assertions in this binary match the plain "[LEVEL] [component]" text
   // captured from a redirected sink; a TTY stderr would tint the level tag.
-  gufo::platform::SetEnv("NO_COLOR", "1");
+  ::setenv("NO_COLOR", "1", 1);
   TestProgressLoggingIsOptInAndBounded();
   TestStructuredOutputIsPreparedBeforeServing();
   TestAdmissionLoggingIsDebugTierOnly();

@@ -636,10 +636,11 @@ void TestIntegerRoutingTensor() {
 }
 
 void TestMappedPrefetch() {
-  char path[] = "/tmp/gufo-prefetch-XXXXXX";
-  const int fd = mkstemp(path);
+  auto path = (std::filesystem::temp_directory_path() / "gufo-prefetch-XXXXXX")
+                  .string();
+  const int fd = mkstemp(path.data());
   Expect(fd >= 0, "create prefetch fixture");
-  unlink(path);
+  unlink(path.c_str());
   constexpr std::size_t bytes = (17U << 20) + 7;
   Expect(ftruncate(fd, bytes) == 0, "size two-chunk prefetch fixture");
   const char marker = 'Q';
@@ -651,6 +652,15 @@ void TestMappedPrefetch() {
   Expect(data[13] == 0 && data[bytes - 1] == marker,
          "parallel unaligned prefetch preserves the complete readable range");
   gufo::core::PrefaultMappedRange(nullptr, 0);
+#ifdef _WIN32
+  // Windows prevents shrinking a file while a section is mapped. The Linux
+  // truncation/fault-propagation case below cannot be induced this way.
+  Expect(ftruncate(fd, 4096) < 0,
+         "Windows rejects truncation of a mapped file");
+  gufo::core::PrefaultMappedRange(data, bytes);
+  Expect(data[bytes - 1] == marker,
+         "rejected truncation preserves mapped data");
+#else
   Expect(ftruncate(fd, 4096) == 0, "truncate mapped fixture");
   bool rejected = false;
   try {
@@ -659,6 +669,7 @@ void TestMappedPrefetch() {
     rejected = true;
   }
   Expect(rejected, "failed parallel reads are joined and propagated");
+#endif
   munmap(const_cast<char*>(data), bytes);
   close(fd);
 }

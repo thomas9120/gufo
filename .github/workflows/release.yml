@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Create CalVer source release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Compute next Windows-Gufo tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          DATE=$(date -u +%Y.%m)
+          PREFIX="Windows-Gufo-${DATE}."
+          REGEX="${PREFIX//./\\.}[0-9]+\$"
+          LAST=$(git ls-remote --tags origin "refs/tags/${PREFIX}*" \
+            | grep -oE "$REGEX" \
+            | awk -F. '{print $NF}' | sort -n | tail -1 || true)
+          NEXT=$(( ${LAST:-0} + 1 ))
+          TAG="${PREFIX}${NEXT}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Created tag: $TAG" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build installer assets
+        shell: bash
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 - <<'PY'
+          import hashlib, os, pathlib
+          tag = os.environ["TAG"].encode()
+          repo = os.environ["REPO"].encode()
+          script = pathlib.Path("tools/installer/Gufo-Setup.ps1").read_bytes().replace(b"@TAG@", tag)
+          pathlib.Path("dist/Gufo-Setup.ps1").write_bytes(script)
+          digest = hashlib.sha256(script).hexdigest().upper()
+          launcher = pathlib.Path("Gufo-Setup.cmd").read_bytes()
+          launcher = launcher.replace(b"@REPO@", repo).replace(b"@TAG@", tag).replace(b"@PS1SHA256@", digest.encode())
+          pathlib.Path("dist/Gufo-Setup.cmd").write_bytes(launcher)
+          print(f"Gufo-Setup.ps1 sha256 {digest}")
+          PY
+          if grep -q "@TAG@\|@PS1SHA256@\|@REPO@" dist/*; then
+            echo "Installer assets still contain release placeholders" >&2
+            exit 1
+          fi
+          (cd dist && sha256sum Gufo-Setup.cmd Gufo-Setup.ps1 > SHA256SUMS)
+
+      - name: Create release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "${{ github.ref_name }}" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --generate-notes
+
+      - name: Upload installer assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ steps.version.outputs.tag }}" \
+            dist/Gufo-Setup.cmd dist/Gufo-Setup.ps1 dist/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --clobber

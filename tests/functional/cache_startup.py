@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Qwen startup identity, RAM reuse and durable restart checks.
+"""Qwen startup identity, RAM reuse, disk restart and corruption checks.
 
 Each run owns its server, disk tier and initially empty XDG cache. Select AR or
 MTP or DFlash2 in the production server command. No weights are downloaded or modified.
@@ -27,7 +27,7 @@ def main():
     parser.add_argument("--startup-timeout", type=float, default=240)
     parser.add_argument("--model-kind", choices=("flash-next", "qwen27b"),
                         default="flash-next")
-    parser.add_argument("--case", action="append", choices=("ram", "disk"),
+    parser.add_argument("--case", action="append", choices=("ram", "disk", "corrupt"),
                         help="Default: RAM startup, then disk startup/restart")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -158,7 +158,7 @@ def main():
                 cold = chat("cold")
                 warm = chat("retry", warm=True)
                 assert continuation.digest(cold) == continuation.digest(warm)
-        if "disk" in selected:
+        if selected & {"disk", "corrupt"}:
             with stage("disk", disk=True):
                 cold = chat("cold")
                 warm = chat("retry", warm=True)
@@ -171,6 +171,31 @@ def main():
             with stage("restart", disk=True):
                 restored = chat("restored", warm=True, disk=True)
                 assert continuation.digest(cold) == continuation.digest(restored)
+            if "corrupt" in selected:
+                # This runner created and owns the cache. Preserve sizes and
+                # manifests so only payload verification can detect damage.
+                damaged = []
+                for directory in ("chunks", "private"):
+                    for path in sorted((output / "cache/v2" / directory).glob("*.bin")):
+                        with path.open("r+b") as file:
+                            first = file.read(1)
+                            assert first, path
+                            file.seek(0)
+                            file.write(bytes((first[0] ^ 255,)))
+                        damaged.append(str(path.relative_to(output)))
+                assert damaged, "no checkpoint payloads to corrupt"
+                report["corrupted_payloads"] = damaged
+                with stage("corrupt", disk=True):
+                    recomputed = chat("recomputed")
+                    assert continuation.digest(cold) == continuation.digest(recomputed)
+                    wait_until(lambda: any(
+                        tokens >= cold["usage"]["prompt_tokens"] - 8
+                        for tokens in published_tokens(
+                            (stage_path / "server.log").read_text())),
+                        "a replacement checkpoint after corruption")
+                with stage("recovered", disk=True):
+                    recovered = chat("restored", warm=True, disk=True)
+                    assert continuation.digest(cold) == continuation.digest(recovered)
         report["status"] = "passed"
     except BaseException as error:
         report.update(status="failed", error=str(error),

@@ -24,11 +24,11 @@ def main():
         return subprocess.run([binary, *args], env=env, text=True,
                               capture_output=True, timeout=10)
 
-    for modality in ("llm", "tts", "asr", "video", "image", "embedding"):
+    for modality in ("llm", "tts", "asr", "video", "image"):
         check(["serve", "--port", "0", modality, "--help"], 0, "--api-key")
         check(["serve", modality, "--port=0", "--help"], 0, "--api-key")
         check(["serve", modality, "--help"], 0, "--log-level")
-        if modality in ("tts", "asr", "image", "embedding"):
+        if modality in ("tts", "asr", "image"):
             help_text = check(["serve", modality, "--help"], 0,
                               "--model")
             assert "--sessions" not in help_text
@@ -41,15 +41,6 @@ def main():
         check(["serve", modality, "--port", "65536"], 2, "--port must")
         check(["serve", modality, "--host", "bad.address"], 2, "--host must")
     check(["serve", "image"], 2, "--model <DIR> is required")
-    check(["serve", "embedding"], 2, "--model <DIR> is required")
-    text = check(["serve", "embedding", "--help"], 0, "--served-model-name")
-    assert "--context" not in text and "--sessions" not in text
-    assert "--default-prompt-name" in text
-    check(["serve", "embedding", "--context", "8"], 2, "Unknown option")
-    check(["serve", "help", "embedding"], 0, "EmbeddingGemma 2")
-    check(["serve", "embedding", "--model", "/missing"], 1,
-          "Error enabling EmbeddingGemma 2 service")
-    check(["serve", "--help"], 0, "/v1/embeddings")
     for modality in ("tts", "asr"):
         check(["serve", modality], 2, "--model <DIR> is required")
         check(["serve", modality, "--model", "/missing", "--context", "0"],
@@ -78,28 +69,10 @@ def main():
     assert "0 = auto, at most the disk budget and 1/8 available RAM" in help_text
     assert "--log-progress" in help_text
     assert "--enable-yarn" in help_text
-    assert "--cache-ram-bytes <N|off>" in help_text
-    for value in ("off", "0", "536870912"):
-        check(["serve", "llm", "--cache-ram-bytes", value,
-               "--model", "missing.gguf"], 1,
-              "Error loading model 'missing.gguf'")
-    for value in ("OFF", "-1", "16G"):
-        check(["serve", "llm", "--cache-ram-bytes", value], 2,
-              "--cache-ram-bytes must be off or a byte count")
     assert "it applies to every request" in help_text
     # The flag is a plain switch: it must not swallow the next argument.
     check(["serve", "llm", "--enable-yarn", "--model", "missing.gguf"], 1,
           "Error loading model 'missing.gguf'")
-    # One process can answer under several names; the first is primary.
-    name_help = next(line for line in help_text.splitlines()
-                     if "--served-model-name" in line)
-    assert "repeatable" in name_help, name_help
-    check(["serve", "llm", "--served-model-name", "a", "--served-model-name",
-           "b", "--model", "missing.gguf"], 1,
-          "Error loading model 'missing.gguf'")
-    check(["serve", "llm", "--served-model-name", "a", "--served-model-name",
-           "a", "--model", "missing.gguf"], 2,
-          "duplicate --served-model-name")
 
     # Verbosity must change the output, not merely parse. The config line is
     # emitted at the debug tier before the model file is opened, so these all
@@ -168,8 +141,7 @@ def main():
         result = run(load + ["--trace", trace])
         assert result.returncode == 1, result.stderr
         assert "[WARN] [trace] event=trace_enabled" in result.stderr
-        if os.name != "nt":
-            assert stat.S_IMODE(os.stat(trace).st_mode) == 0o600
+        assert stat.S_IMODE(os.stat(trace).st_mode) == 0o600
     # Every help variant groups verbosity the same way: a "Logging:" section,
     # with no hand-written "Server Options:" list to drift from the parser.
     for args in (["serve", "--help"], ["serve", "llm", "--help"],

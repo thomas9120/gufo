@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -16,6 +17,7 @@
 
 #include "src/cli/serve/generation_metrics.hpp"
 #include "src/cli/serve/text_generation_backend.hpp"
+#include "src/core/platform/socket.hpp"
 
 namespace gufo::server {
 
@@ -23,7 +25,6 @@ class VideoJobService;
 class TtsService;
 class AsrService;
 class ImageService;
-class EmbeddingService;
 class WebSocket;
 
 struct HttpRequest {
@@ -95,10 +96,9 @@ struct HttpServerOptions {
   std::size_t max_connections{16};
   std::string api_key;
   std::chrono::milliseconds sse_heartbeat_interval{std::chrono::seconds(15)};
-  /// Called once, on the listener or a request thread, when the text backend or
-  /// the embedding service reports a lost device. Health, readiness and
-  /// generation answer 503 `device_lost` from then on; the hook decides how the
-  /// process exits.
+  /// Called once, on the listener or a request thread, when the backend reports
+  /// a lost device. Health, readiness and generation answer 503 `device_lost`
+  /// from then on; the hook decides how the process exits.
   std::function<void()> on_device_lost{};
 };
 
@@ -115,8 +115,7 @@ public:
              std::shared_ptr<TtsService> tts = nullptr,
              std::shared_ptr<AsrService> asr = nullptr,
              HttpServerOptions options = {},
-             std::shared_ptr<ImageService> images = nullptr,
-             std::shared_ptr<EmbeddingService> embeddings = nullptr);
+             std::shared_ptr<ImageService> images = nullptr);
   ~HttpServer();
 
   HttpServer(const HttpServer&) = delete;
@@ -131,6 +130,7 @@ public:
 
   /// Blocking accept loop. The CLI handles SIGINT/SIGTERM; embedded callers
   /// retain their own process signal handlers and call stop() explicitly.
+  /// On Windows the CLI also handles Ctrl+C and Ctrl+Break console events.
   void run(bool handle_signals = false);
 
   void stop();
@@ -142,7 +142,7 @@ private:
 
   HttpResponse handle_request(const HttpRequest& req);
   bool device_lost();
-  void handle_connection(int client_fd, std::atomic<bool>& response_sent);
+  void handle_connection(platform::SocketHandle client_fd);
   void reap_workers();
   void register_routes();
 
@@ -153,11 +153,11 @@ private:
   std::shared_ptr<TtsService> tts_;
   std::shared_ptr<AsrService> asr_;
   std::shared_ptr<ImageService> images_;
-  std::shared_ptr<EmbeddingService> embeddings_;
   HttpServerOptions options_;
   std::string api_key_hash_;
-  int listen_fd_ = -1;
+  platform::SocketHandle listen_fd_ = platform::kInvalidSocket;
   std::atomic<bool> stopped_{false};
+  std::stop_source websocket_stop_;
   std::atomic<bool> device_lost_reported_{false};
   std::mutex workers_mutex_;
   std::vector<std::unique_ptr<ConnectionWorker>> workers_;
@@ -184,23 +184,24 @@ public:
   LoadingResponder& operator=(LoadingResponder&&) = delete;
 
   /// True while the responder owns the listen socket.
-  [[nodiscard]] bool listening() const noexcept { return listen_fd_ >= 0; }
+  [[nodiscard]] bool listening() const noexcept {
+    return listen_fd_ != platform::kInvalidSocket;
+  }
 
   /// Stops answering and releases the port. Returns within one poll interval
-  /// plus the bounded waits for a request that is still arriving and for the
-  /// answered client to close.
+  /// plus the bounded wait for a request that is still arriving.
   void stop();
 
 private:
   void serve();
 
-  int listen_fd_ = -1;
+  platform::SocketHandle listen_fd_ = platform::kInvalidSocket;
   std::atomic<bool> stopped_{false};
   std::thread thread_;
 };
 
-/// Scheduled requests are recorded by the scheduler when they finish. Other
-/// backends contribute here, at completion.
+/// Scheduled requests publish prompt work as each chunk executes. Other
+/// backends contribute their prompt work here, at completion.
 inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
   if (result.token_metrics_recorded)
     return;
@@ -211,8 +212,7 @@ inline void RecordServerMetrics(const TextGenerationBackend::Result& result) {
           ? result.prefill_tokens
           : result.prompt_tokens -
                 std::min(result.prompt_tokens, result.cached_prompt_tokens);
-  detail::TotalPromptTokens().fetch_add(prompt_tokens,
-                                        std::memory_order_relaxed);
+  detail::TotalPromptMetrics().Add(prompt_tokens, result.prefill_ms);
   detail::TotalGenTokens().fetch_add(result.completion_tokens,
                                      std::memory_order_relaxed);
   RecordRequestMetrics(result);

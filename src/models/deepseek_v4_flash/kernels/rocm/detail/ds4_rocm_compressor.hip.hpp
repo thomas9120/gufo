@@ -188,7 +188,7 @@ static int hip_compressor_shape_supported(uint32_t head_dim, uint32_t ratio) {
     return head_dim <= UINT32_MAX / coff;
 }
 
-extern "C" int ds4_gpu_compressor_store_batch_tensor(
+static int ds4_gpu_compressor_store_batch_tensor(
         const ds4_gpu_tensor *kv,
         const ds4_gpu_tensor *sc,
         ds4_gpu_tensor       *state_kv,
@@ -203,7 +203,6 @@ extern "C" int ds4_gpu_compressor_store_batch_tensor(
         uint32_t                n_tokens) {
     if (!kv || !sc || !state_kv || !state_score || !model_map ||
         !hip_compressor_shape_supported(head_dim, ratio) || n_tokens == 0 ||
-        n_tokens > ratio - pos0 % ratio ||
         !hip_ape_type_supported(ape_type)) {
         return 0;
     }

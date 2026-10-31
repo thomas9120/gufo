@@ -17,46 +17,6 @@
       }
     },
     {
-      "name": "windows-base",
-      "hidden": true,
-      "inherits": "base",
-      "description": "Windows MSVC host + TheRock HIP SDK device toolchain",
-      "condition": {
-        "type": "equals",
-        "lhs": "${hostSystemName}",
-        "rhs": "Windows"
-      },
-      "toolchainFile": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
-      "cacheVariables": {
-        "VCPKG_MANIFEST_INSTALL": "ON",
-        "VCPKG_TARGET_TRIPLET": "x64-windows-release",
-        "VCPKG_HOST_TRIPLET": "x64-windows-release",
-        "VCPKG_CHAINLOAD_TOOLCHAIN_FILE": "${sourceDir}/cmake/toolchains/windows-therock.cmake"
-      }
-    },
-    {
-      "name": "windows-cpu-test",
-      "displayName": "Windows CPU Tests",
-      "description": "Host-contract suite on Windows without HIP",
-      "inherits": "windows-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "BUILD_TESTING": "ON",
-        "ENGINE_ENABLE_HIP": "OFF"
-      }
-    },
-    {
-      "name": "windows-release",
-      "displayName": "Windows Release",
-      "description": "Windows gfx1151 build used by the Devlab Windows checks",
-      "inherits": "windows-base",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
-        "BUILD_TESTING": "OFF",
-        "ENGINE_ENABLE_HIP": "ON"
-      }
-    },
-    {
       "name": "release",
       "displayName": "Release",
       "description": "Production gfx1151 build; same optimization as the Nix package",
@@ -101,19 +61,29 @@
         "ENGINE_ENABLE_HIP": "ON",
         "GUFO_BUILD_TOOLS": "ON"
       }
+    },
+    {
+      "name": "windows-cpu",
+      "displayName": "Windows CPU integration checks",
+      "inherits": "cpu-test",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-gpu",
+      "displayName": "Windows gfx1151 GPU build",
+      "inherits": "gpu-test",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
     }
   ],
   "buildPresets": [
-    {
-      "name": "windows-cpu-test",
-      "displayName": "Windows CPU Tests",
-      "configurePreset": "windows-cpu-test"
-    },
-    {
-      "name": "windows-release",
-      "displayName": "Windows Release",
-      "configurePreset": "windows-release"
-    },
     {
       "name": "release",
       "displayName": "Release",
@@ -139,6 +109,31 @@
       "configurePreset": "cpu-test",
       "targets": [
         "check-pr"
+      ]
+    },
+    {
+      "name": "windows-gpu",
+      "configurePreset": "windows-gpu",
+      "targets": [
+        "gufo-server"
+      ]
+    },
+    {
+      "name": "windows-cpu",
+      "configurePreset": "windows-cpu",
+      "targets": [
+        "gufo-server",
+        "arg_parser_test",
+        "gguf_reader_test",
+        "gguf_identity_test",
+        "win32_compat_test",
+        "win32_filesystem_test",
+        "win32_disk_store_test",
+        "win32_host_test",
+        "json_test",
+        "json_constraint_test",
+        "http_server_test",
+        "audio_websocket_test"
       ]
     }
   ],
@@ -208,6 +203,18 @@
       "filter": {
         "include": {
           "label": "qwen-kernel-oracle"
+        }
+      }
+    },
+    {
+      "name": "windows-cpu",
+      "configurePreset": "windows-cpu",
+      "output": {
+        "outputOnFailure": true
+      },
+      "filter": {
+        "include": {
+          "name": "^(gufo_version|gufo_help|arg_parser_test|gguf_reader_test|gguf_identity_test|win32_compat_test|win32_filesystem_test|win32_disk_store_test|win32_host_test|json_test|json_constraint_test|cache_boundary_test|http_server_test|audio_websocket_test|win32_server_shutdown_test|win32_queue_policy_test)$"
         }
       }
     }

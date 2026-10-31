@@ -1,0 +1,52 @@
+{
+  "_comment": "Batch planning rules for tools/windows/sync-inventory.ps1; see docs/WINDOWS-UPSTREAM-SYNC.md#batching. Paths are PowerShell -like patterns ('*' also matches '/'). A commit is convergence or timing if any changed path matches; src/ files changed by a known regression's revert also count as timing. shared marks non-inert files listed in shared-edits.json. A commit that is neither convergence nor timing is inert if every path matches the inert patterns, otherwise contained. A batch ends at a release commit unless it holds no convergence or timing commit, and ends early when the next commit would exceed a limit.",
+  "limits": {
+    "convergence": 2,
+    "timing": 4
+  },
+  "releaseCuts": true,
+  "classes": {
+    "convergence": {
+      "paths": [
+        "compat/*",
+        "src/core/platform/*",
+        "src/core/hip/*",
+        "src/cache/*",
+        ".github/workflows/windows*"
+      ],
+      "checks": "Decide fork-or-upstream for each overlapping implementation, review every affected compatibility contract, and run the Windows CPU gate plus the Windows HIP build."
+    },
+    "timing": {
+      "paths": [
+        "src/models/qwen/*",
+        "src/models/qwen38_flash_next/*",
+        "src/core/speculative/*",
+        "src/core/sampling.*",
+        "src/core/quant/*"
+      ],
+      "checks": "Run matched Windows timing controls for the affected models, including the first-request control, at the per-request 5% and 3 ms gates. On failure, revert-test only this batch's timing commits."
+    },
+    "shared": {
+      "checks": "Review the fork's edits in the listed shared files and their contracts, even when the merge is clean."
+    },
+    "contained": {
+      "checks": "Run the bounded Windows CPU gate and the affected functional suites."
+    },
+    "inert": {
+      "paths": [
+        "*.md",
+        "docs/*",
+        "LICENSE",
+        "NOTICE",
+        "version.txt",
+        ".release-please-manifest.json",
+        "flake.nix",
+        "flake.lock",
+        ".devops/*",
+        ".github/*",
+        "tests/functional/*"
+      ],
+      "checks": "Run the documentation, formatting and build checks only."
+    }
+  }
+}

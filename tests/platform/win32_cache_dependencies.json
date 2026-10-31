@@ -1,0 +1,3 @@
+{
+  "gufo_posix_compat": ["ws2_32", "psapi", "advapi32"]
+}

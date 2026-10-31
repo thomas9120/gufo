@@ -1,7 +1,6 @@
 #include "src/cli/serve/text_model_runner.hpp"
 
 #include <algorithm>
-#include <charconv>
 #include <chrono>
 #include <fstream>
 #include <future>
@@ -169,6 +168,11 @@ namespace {
 /// allocations draw from the same RAM, so HIP's device capacity is not used.
 std::uint64_t HostAvailableBytes() {
   std::uint64_t available = platform::AvailableMemoryBytes();
+#ifdef _WIN32
+  // WINDOWS: Skip Linux CMA/cgroup accounting. This is host physical RAM,
+  // not the WDDM device allocation budget (qualified separately).
+  return available;
+#else
   std::ifstream meminfo("/proc/meminfo");
   std::ostringstream meminfo_text;
   meminfo_text << meminfo.rdbuf();
@@ -179,6 +183,7 @@ std::uint64_t HostAvailableBytes() {
   membership_text << membership.rdbuf();
   return CgroupAvailableBytes("/sys/fs/cgroup", membership_text.str(),
                               available);
+#endif
 }
 
 std::size_t ClampToSize(std::uint64_t bytes) {
@@ -197,24 +202,6 @@ std::size_t HostSnapshotCeilingBytes() {
   return ClampToSize(available > kHostSnapshotHeadroomBytes
                          ? available - kHostSnapshotHeadroomBytes
                          : 0);
-}
-
-std::optional<TextRunnerRamCacheOptions> ParseRamCacheOption(
-    std::string_view text, std::string* error) {
-  if (text == "off")
-    return TextRunnerRamCacheOptions{.enabled = false};
-  std::size_t bytes = 0;
-  const auto end = text.data() + text.size();
-  const auto parsed = std::from_chars(text.data(), end, bytes);
-  if (text.empty() || parsed.ec != std::errc{} || parsed.ptr != end) {
-    if (error)
-      *error =
-          "--cache-ram-bytes must be off or a byte count (0 = auto), "
-          "not '" +
-          std::string(text) + "'";
-    return std::nullopt;
-  }
-  return TextRunnerRamCacheOptions{.capacity_bytes = bytes};
 }
 
 namespace {
@@ -503,9 +490,7 @@ void EmitDiskEvent(const ContinuationDiskEvent& event) noexcept {
 
 ContinuationCache::SnapshotSupport MakeSnapshotSupport(
     ValidatedRunner* validated, TextRunnerRamCacheOptions options) {
-  // Off holds live session state only, as for a runner that cannot snapshot.
-  if (validated == nullptr || !options.enabled ||
-      !validated->descriptor.capabilities.snapshot ||
+  if (validated == nullptr || !validated->descriptor.capabilities.snapshot ||
       !validated->descriptor.capabilities.fork) {
     return {};
   }
@@ -572,7 +557,6 @@ TextDecodeStep TextModelRunner::DecodeStep(
         .draft_tokens = 0,
         .draft_accepted_tokens = 0,
         .stop = true,
-        .terminal_logprobs = std::move(selection.logprobs),
     };
   }
   const TextRunnerToken token = selection.token;
@@ -666,14 +650,11 @@ struct TextRunnerPool::Impl {
               : std::min(TextRunnerRamCacheOptions::kAutomaticMaxBytes,
                          automatic);
       // This is an upper bound. Providers commit backing only after their
-      // slots allocate and the cache observes remaining host capacity. Slots
-      // allocate under the ceiling; what they pin is charged on top of this.
-      // The state claim includes lazy image/rollback storage, not startup
-      // usage.
+      // slots allocate and the cache observes remaining host capacity. The
+      // state claim includes lazy image/rollback storage, not startup usage.
       component_cache = std::make_unique<ComponentTextCache>(
           validated.runner, state_count, std::min(requested, ceiling),
-          disk_cache_options, !ram_cache_options.capacity_bytes, ceiling,
-          ram_cache_options.enabled);
+          disk_cache_options, !ram_cache_options.capacity_bytes);
       if (disk_cache_options) {
         shared_prefix_min_tokens = disk_cache_options->shared_prefix_min_tokens;
         shared_prefix_max_boundaries =
@@ -699,14 +680,11 @@ struct TextRunnerPool::Impl {
           "cache",
           "event=snapshot_cache_configured sessions=" +
               std::to_string(state_count) + " snapshot_entries=" +
-              std::to_string(ram_cache_options.enabled ? cache->entry_capacity()
-                                                       : 0) +
-              " capacity_bytes=" +
+              std::to_string(cache->entry_capacity()) + " capacity_bytes=" +
               std::to_string(cache->snapshot_capacity_bytes()) +
               " automatic_bytes=" +
               std::to_string(validated.snapshot_automatic_bytes) +
-              " max_bytes=" + std::to_string(validated.snapshot_max_bytes) +
-              " ram_cache=" + (ram_cache_options.enabled ? "on" : "off"));
+              " max_bytes=" + std::to_string(validated.snapshot_max_bytes));
     }
     if (disk_cache_options.has_value()) {
       if (!validated.descriptor.persistence.has_value()) {
@@ -2062,7 +2040,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     const sampling::SamplingConfig& sampling_config,
     const CancellationCheck& is_cancelled,
     std::shared_ptr<const TextPromptContext> context, bool reuse_prompt,
-    std::size_t cache_prefix_tokens, bool stop_at_eos, bool persist) {
+    std::size_t cache_prefix_tokens, bool stop_at_eos) {
   sampling_config.Validate();
   if (prompt.empty()) {
     throw std::invalid_argument("text runner prompt must not be empty");
@@ -2082,7 +2060,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
   if (impl_->component_cache) {
     auto lease = impl_->component_cache->Acquire(
         prompt, is_cancelled, context, reuse_prompt, cache_prefix_tokens,
-        stop_at_eos, persist);
+        stop_at_eos);
     if (!lease)
       return {};
     Request request(std::make_unique<Request::Impl>(
@@ -2159,7 +2137,7 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
                            prefix.size());
       }
       if (snapshot) {
-        if (impl_->disk_store && persist) {
+        if (impl_->disk_store) {
           try {
             const auto prefix_identity =
                 PrefixInputIdentity(identity, input_prefixes, prefix.size());
@@ -2209,10 +2187,8 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
       impl_->validated.runner->SetPromptContext(state, context);
     }
   }
-  // A request that must stay off disk may still restore from it above, but
-  // neither plans nor writes any disk checkpoint of its own.
   std::vector<std::size_t> boundaries;
-  if (reuse_prompt && persist && impl_->disk_store != nullptr &&
+  if (reuse_prompt && impl_->disk_store != nullptr &&
       !(is_cancelled && is_cancelled())) {
     try {
       boundaries = impl_->disk_store->SharedPrefixBoundaries(
@@ -2226,10 +2202,9 @@ TextRunnerPool::Request TextRunnerPool::Acquire(
     });
   }
   Request request(std::make_unique<Request::Impl>(
-      impl_->validated.runner, persist ? impl_->disk_store : nullptr,
-      std::move(lease), std::move(prompt), std::move(boundaries),
-      sampling_config, std::move(context), cache_prefix_tokens,
-      impl_->cache->capacity() > 1));
+      impl_->validated.runner, impl_->disk_store, std::move(lease),
+      std::move(prompt), std::move(boundaries), sampling_config,
+      std::move(context), cache_prefix_tokens, impl_->cache->capacity() > 1));
   request.impl_->cancelled = is_cancelled;
   // Prompts that diverge from a retained one after a long common prefix,
   // such as new conversations under one system prompt, publish a checkpoint

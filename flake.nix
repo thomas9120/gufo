@@ -3,8 +3,6 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # ROCm 10.1.0 / HIP Clang 24, with gfx1151 binaries on gufo.cachix.org.
-    nixpkgs-rocm10.url = "github:gufo-org/nixpkgs/1a6ba8bc6f744f7a843d025e46bc9911b4b6c37d";
     # Reference ASR/TTS runtime for benchmark comparisons; exposes a
     # ROCm gfx1151 package tuned for Strix Halo.
     audio-cpp = {
@@ -13,17 +11,8 @@
     };
   };
 
-  # Prebuilt outputs that cache.nixos.org lacks (patched ROCr, gufo, the
-  # gfx1151 reference builds and the ROCm Python tools).
-  nixConfig = {
-    extra-substituters = [ "https://gufo.cachix.org" ];
-    extra-trusted-public-keys = [
-      "gufo.cachix.org-1:rfZe3n4lHINgyoACKzs5EthIZmBNvEyCCtufUpth0PE="
-    ];
-  };
-
   outputs =
-    { self, nixpkgs, nixpkgs-rocm10, audio-cpp }:
+    { self, nixpkgs, audio-cpp }:
     let
       # Strix Halo is a Linux x86-64-only target (see README non-goals).
       forAllSystems = nixpkgs.lib.genAttrs [ "x86_64-linux" ];
@@ -37,28 +26,15 @@
         value;
       revision = self.shortRev or self.dirtyShortRev or "dirty";
 
-      # Reuse the cached ROCm closure, including its matching compiler/runtime.
-      # Python and general dependencies stay on the nixos-unstable input.
-      rocmPkgs = forAllSystems (system: import nixpkgs-rocm10 { inherit system; });
-      pkgs = forAllSystems (system: import nixpkgs {
-        inherit system;
-        overlays = [ (_final: _prev: {
-          rocmPackages = rocmPkgs.${system}.rocmPackages_10;
-        }) ];
-      });
+      pkgs = forAllSystems (system: import nixpkgs { inherit system; });
 
       gufoPackages = forAllSystems (
         system:
-        pkgs.${system}.callPackage ./.devops/nix/scope.nix {
-          inherit revision;
-          rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
-        }
+        pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit revision; }
       );
 
       llamaReferences = forAllSystems (
-        system: pkgs.${system}.callPackage ./.devops/nix/llama-cpp-reference.nix {
-          rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
-        }
+        system: pkgs.${system}.callPackage ./.devops/nix/llama-cpp-reference.nix { }
       );
 
       alexnetWeights = system:
@@ -78,32 +54,27 @@
       # dependency of the server (see tools/README.md for the offline toolchain).
       # Unified python313 + torchWithRocm: every Strix Halo box ships ROCm, so
       # the single toolchain serves CPU flows and the --device cuda
-      # reference forward alike. Built from plain nixos-unstable, without the
-      # ROCm 10.1 overlay, so torchWithRocm and its ROCm closure come from
-      # cache.nixos.org.
+      # reference forward alike. gfx1151 verified on this host.
       pythonTools = system:
-        let pt = nixpkgs.legacyPackages.${system}.python313; in
+        let pt = pkgs.${system}.python313; in
         pt.withPackages (
           ps:
           let
             # Nixpkgs' default torchvision/lpips closures use CPU torch.
             # Override both edges so evaluation has one ROCm torch derivation.
-            # The default target list includes gfx1151; keep it so the cached
-            # build is used.
-            torchRocm = ps.torchWithRocm;
             torchvisionRocm = ps.torchvision.override {
-              torch = torchRocm;
+              torch = ps.torchWithRocm;
             };
             lpipsRocm = ps.lpips.override {
-              torch = torchRocm;
+              torch = ps.torchWithRocm;
               torchvision = torchvisionRocm;
             };
             accelerateRocm = ps.accelerate.override {
-              torch = torchRocm;
+              torch = ps.torchWithRocm;
             };
           in
           [
-            torchRocm
+            ps.torchWithRocm
             torchvisionRocm
             ps.transformers
             accelerateRocm
@@ -114,8 +85,6 @@
             ps.jsonschema # independent structured-output schema oracle
             lpipsRocm
             ps.numpy
-            ps.av # official video decoder oracle
-            ps.librosa # pinned official EmbeddingGemma audio decoder oracle
             ps.scipy
             ps.matplotlib # benchmark charts (tools/bench/model-bench.py render)
           ]
@@ -159,20 +128,9 @@
           # Official artifacts select this output from a tagged source. The
           # default package remains visibly developmental on moving branches.
           release = base.override { inherit releaseVersion; };
-          # Windows test binaries of the platform leaves and the CPU cache,
-          # cross-built here and run on a Windows CI host.
-          windows-platform-tests =
-            pkgs.${system}.pkgsCross.mingwW64.callPackage ./.devops/nix/windows-platform-tests.nix
-              {
-                # The build-host ccache from the main package set, which the
-                # binary cache already holds.
-                inherit (pkgs.${system}) ccache;
-              };
           # Optional benchmark packages: excluded from Gufo, the default
           # development shell and hosted checks.
-          ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix {
-            rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
-          };
+          ds4-reference = pkgs.${system}.callPackage ./.devops/nix/ds4-reference.nix { };
           llama-cpp-reference = llamaReferences.${system}.release;
           llama-cpp-mtp-reference = llamaReferences.${system}.mtp;
         }
@@ -190,7 +148,7 @@
               pkgs.${system}.clang-tools
               pkgs.${system}.ffmpeg-headless
               pkgs.${system}.sox
-              pkgs.${system}.rocmPackages.gfx1151.rocprofiler-sdk
+              pkgs.${system}.rocmPackages.rocprofiler-sdk
               pkgs.${system}.sqlite
               # Debugging and repository work. The test presets build
               # RelWithDebInfo with assertions, and contributors commit with
@@ -201,14 +159,10 @@
               # Compiler cache for the local loop; CMake attaches it as the C
               # and C++ launcher when it is on PATH, as the CPU checks do.
               pkgs.${system}.ccache
-              (audio-cpp.packages.${system}.rocm-gfx1151.override {
-                rocmPackages = pkgs.${system}.rocmPackages.gfx1151;
-              })
+              audio-cpp.packages.${system}.rocm-gfx1151
             ];
             env = {
               TORCH_HOME = "${alexnetTorchHome system}";
-              # CMake links HIP binaries against the patched ROCr.
-              GUFO_ROCR_LIBRARY_DIR = "${self.packages.${system}.default.rocmRuntime}/lib";
               LD_LIBRARY_PATH = pkgs.${system}.lib.makeLibraryPath [
                 self.packages.${system}.default.rocmRuntime
                 pkgs.${system}.stdenv.cc.cc.lib
@@ -224,6 +178,7 @@
               export CCACHE_NOHASHDIR=true
             '';
           };
+
         }
       );
 
@@ -361,9 +316,6 @@
               pkgsSys.libpng
               pkgsSys.libjpeg
               pkgsSys.libwebp
-              pkgsSys.libsndfile
-              pkgsSys.soxr
-              pkgsSys.ffmpeg-headless
               pkgsSys.openssl
             ];
             src = staticAnalysisSource;
@@ -481,9 +433,6 @@
               pkgsSys.libpng
               pkgsSys.libjpeg
               pkgsSys.libwebp
-              pkgsSys.libsndfile
-              pkgsSys.soxr
-              pkgsSys.ffmpeg-headless
               pkgsSys.openssl
             ];
             src = testSource;

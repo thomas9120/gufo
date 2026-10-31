@@ -1,12 +1,19 @@
 #include "src/core/diagnostics/linux_sysfs.h"
 
+#include <sys/utsname.h>
+
+#ifdef _WIN32
+#include <cpuid.h>
+#include <windows.h>
+
+#include <cstring>
+#endif
+
 #include <charconv>
 #include <fstream>
 #include <set>
 #include <sstream>
 #include <string_view>
-
-#include "src/core/platform/os_info.hpp"
 
 namespace gufo::diagnostics {
 
@@ -28,6 +35,57 @@ std::uint32_t ParseUint(std::string_view str) {
   std::from_chars(begin, finish, val);
   return val;
 }
+
+#ifdef _WIN32
+std::uint32_t CountProcessorRelationships(
+    LOGICAL_PROCESSOR_RELATIONSHIP relationship) {
+  DWORD bytes = 0;
+  if (GetLogicalProcessorInformationEx(relationship, nullptr, &bytes) ||
+      GetLastError() != ERROR_INSUFFICIENT_BUFFER)
+    return 0;
+  std::vector<unsigned char> storage(bytes);
+  if (!GetLogicalProcessorInformationEx(
+          relationship,
+          reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(
+              storage.data()),
+          &bytes))
+    return 0;
+  std::uint32_t count = 0;
+  for (std::size_t offset = 0; offset < bytes;) {
+    const auto* item =
+        reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(
+            storage.data() + offset);
+    if (item->Relationship == relationship)
+      ++count;
+    offset += item->Size;
+  }
+  return count;
+}
+
+HostCpuInfo WindowsCpuInfo() {
+  HostCpuInfo cpu;
+  unsigned regs[4]{};
+  if (__get_cpuid(0, &regs[0], &regs[1], &regs[2], &regs[3])) {
+    char vendor[13]{};
+    std::memcpy(vendor, &regs[1], 4);
+    std::memcpy(vendor + 4, &regs[3], 4);
+    std::memcpy(vendor + 8, &regs[2], 4);
+    cpu.vendor_id = vendor;
+  }
+  char brand[49]{};
+  for (unsigned leaf = 0; leaf < 3; ++leaf) {
+    if (!__get_cpuid(0x80000002U + leaf, &regs[0], &regs[1], &regs[2],
+                     &regs[3]))
+      break;
+    std::memcpy(brand + leaf * 16, regs, 16);
+  }
+  cpu.model_name = Trim(brand);
+  cpu.logical_cores = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+  cpu.physical_cores = CountProcessorRelationships(RelationProcessorCore);
+  cpu.numa_nodes = CountProcessorRelationships(RelationNumaNode);
+  return cpu;
+}
+#endif
 
 }  // namespace
 
@@ -53,20 +111,24 @@ std::optional<std::string> LinuxSysfs::ReadFile(
 
 std::optional<HostUnameInfo> LinuxSysfs::QueryUname() const {
   const auto version_opt = ReadFile(proc_root_ / "version");
-  const auto host = platform::QueryHostIdentity();
-  if (!host) {
-    return std::nullopt;
+  struct utsname uts{};
+  if (uname(&uts) == 0) {
+    HostUnameInfo info;
+    info.sysname = uts.sysname;
+    info.nodename = uts.nodename;
+    info.release = uts.release;
+    info.version = version_opt ? *version_opt : uts.version;
+    info.machine = uts.machine;
+    return info;
   }
-  HostUnameInfo info;
-  info.sysname = host->sysname;
-  info.nodename = host->nodename;
-  info.release = host->release;
-  info.version = version_opt ? *version_opt : host->version;
-  info.machine = host->machine;
-  return info;
+  return std::nullopt;
 }
 
 std::optional<HostCpuInfo> LinuxSysfs::QueryCpuInfo() const {
+#ifdef _WIN32
+  if (proc_root_ == std::filesystem::absolute("/proc"))
+    return WindowsCpuInfo();
+#endif
   const auto content_opt = ReadFile(proc_root_ / "cpuinfo");
   if (!content_opt) {
     return std::nullopt;
@@ -114,6 +176,20 @@ std::optional<HostCpuInfo> LinuxSysfs::QueryCpuInfo() const {
 }
 
 std::optional<HostMemInfo> LinuxSysfs::QueryMemInfo() const {
+#ifdef _WIN32
+  if (proc_root_ == std::filesystem::absolute("/proc")) {
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (!GlobalMemoryStatusEx(&status))
+      return std::nullopt;
+    HostMemInfo info;
+    info.total_bytes = status.ullTotalPhys;
+    info.available_bytes = status.ullAvailPhys;
+    // Windows does not expose Linux MemFree or the memory hardware type here.
+    info.is_unified_memory = false;
+    return info;
+  }
+#endif
   const auto content_opt = ReadFile(proc_root_ / "meminfo");
   if (!content_opt) {
     return std::nullopt;
